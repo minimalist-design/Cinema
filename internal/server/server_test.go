@@ -221,7 +221,7 @@ func TestEndToEnd(t *testing.T) {
 	client := tmdb.New("test-token", "en-US")
 	client.BaseURL, client.ImageBaseURL = fake.URL, fake.URL+"/img"
 	img := images.New(filepath.Join(tmp, "cache"), database, client)
-	sc := scanner.New(context.Background(), database, client, img, moviesDir, tvDir)
+	sc := scanner.New(context.Background(), database, client, img, nil, moviesDir, tvDir)
 
 	st := sc.Run(context.Background(), false)
 	if len(st.Errors) > 0 {
@@ -396,14 +396,12 @@ func TestEndToEnd(t *testing.T) {
 }
 
 type playbackInfo struct {
-	Mode     string   `json:"mode"`
-	URL      string   `json:"url"`
-	Start    float64  `json:"start"`
-	Duration *float64 `json:"duration"`
+	Mode string `json:"mode"`
+	URL  string `json:"url"`
 }
 
-// testPlayback checks that MP4s play directly and MKVs go through the
-// transcoder when ffmpeg is available.
+// testPlayback checks that MP4s play directly and MKVs are streamed as HLS
+// when ffmpeg is available.
 func testPlayback(t *testing.T, database *sql.DB, sc *scanner.Scanner, img *images.Cache, mp4ID int, mkvPath string) {
 	var mkvID int
 	if err := database.QueryRow(`SELECT id FROM files WHERE path = ?`, mkvPath).Scan(&mkvID); err != nil {
@@ -418,39 +416,64 @@ func testPlayback(t *testing.T, database *sql.DB, sc *scanner.Scanner, img *imag
 	if pb.Mode != "direct" || pb.URL != "/api/stream/"+itoa(mkvID) {
 		t.Errorf("mkv playback without ffmpeg = %+v", pb)
 	}
-	if code := getJSON(t, h, "/api/transcode/"+itoa(mkvID), nil); code != http.StatusNotImplemented {
-		t.Errorf("transcode without ffmpeg = %d", code)
+	if code := getJSON(t, h, "/api/hls/"+itoa(mkvID)+"/abcdefgh/index.m3u8", nil); code != http.StatusNotImplemented {
+		t.Errorf("hls without ffmpeg = %d", code)
 	}
 
 	tc, err := transcode.New("ffmpeg", "ffprobe")
 	if err != nil {
 		t.Skip("ffmpeg not installed:", err)
 	}
-	h = server.New(database, sc, img, web, tc).Handler()
+	hls, err := transcode.NewHLS(transcode.NewStore(database, tc), tc, filepath.Join(t.TempDir(), "hls"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hls.Close()
+	h = server.New(database, sc, img, web, hls).Handler()
 	getJSON(t, h, "/api/playback/"+itoa(mp4ID), &pb)
 	if pb.Mode != "direct" {
 		t.Errorf("mp4 playback = %+v", pb)
 	}
 
-	// Replace the placeholder episode with a real 4s MKV (H.264 + AC3).
+	// Replace the placeholder episode with a real 8s MKV (H.264 + AC3).
 	cmd := exec.Command("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24",
-		"-f", "lavfi", "-i", "sine", "-t", "4", "-c:v", "libx264", "-c:a", "ac3", "-f", "matroska", mkvPath)
+		"-f", "lavfi", "-i", "sine", "-t", "8", "-c:v", "libx264", "-g", "24", "-c:a", "ac3", "-f", "matroska", mkvPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("can't generate test media: %v: %s", err, out)
 	}
 	pb = playbackInfo{}
-	getJSON(t, h, "/api/playback/"+itoa(mkvID)+"?start=0", &pb)
-	if pb.Mode != "transcode" || pb.Duration == nil || *pb.Duration < 3.9 || pb.URL != "/api/transcode/"+itoa(mkvID)+"?start=0.000" {
+	getJSON(t, h, "/api/playback/"+itoa(mkvID), &pb)
+	prefix := "/api/hls/" + itoa(mkvID) + "/"
+	if pb.Mode != "hls" || !strings.HasPrefix(pb.URL, prefix) || !strings.HasSuffix(pb.URL, "/index.m3u8") {
 		t.Fatalf("mkv playback = %+v", pb)
 	}
-	if code := getJSON(t, h, "/api/playback/"+itoa(mkvID)+"?start=-1", nil); code != http.StatusBadRequest {
-		t.Errorf("negative start = %d", code)
+	var other playbackInfo
+	getJSON(t, h, "/api/playback/"+itoa(mkvID), &other)
+	if other.URL == pb.URL {
+		t.Error("playbacks share a session")
 	}
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", pb.URL, nil))
-	if rec.Code != 200 || rec.Header().Get("Content-Type") != "video/mp4" || !strings.Contains(rec.Body.String()[:64], "ftyp") {
-		t.Errorf("transcode: %d %q, %d bytes", rec.Code, rec.Header().Get("Content-Type"), rec.Body.Len())
+	body := rec.Body.String()
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "application/vnd.apple.mpegurl" ||
+		strings.Count(body, "#EXTINF:") != 2 || !strings.Contains(body, "\n0.ts\n") || !strings.HasSuffix(body, "\n1.ts\n#EXT-X-ENDLIST\n") {
+		t.Errorf("playlist: %d %q\n%s", rec.Code, rec.Header().Get("Content-Type"), body)
+	}
+
+	base := strings.TrimSuffix(pb.URL, "index.m3u8")
+	for _, seg := range []string{"1.ts", "0.ts"} {
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", base+seg, nil))
+		// MPEG-TS packets start with the sync byte 0x47.
+		if rec.Code != 200 || rec.Header().Get("Content-Type") != "video/mp2t" || rec.Body.Len() < 188 || rec.Body.Bytes()[0] != 0x47 {
+			t.Errorf("segment %s: %d %q, %d bytes", seg, rec.Code, rec.Header().Get("Content-Type"), rec.Body.Len())
+		}
+	}
+	for _, u := range []string{base + "2.ts", base + "x.ts", prefix + "bad!/0.ts", "/api/hls/999999/abcdefgh/index.m3u8"} {
+		if code := getJSON(t, h, u, nil); code != http.StatusNotFound {
+			t.Errorf("%s = %d, want 404", u, code)
+		}
 	}
 }
 

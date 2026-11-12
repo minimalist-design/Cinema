@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -38,13 +39,22 @@ func main() {
 
 	client := tmdb.New(cfg.TMDBToken, cfg.TMDBLanguage)
 	imgCache := images.New(cfg.CacheDir, database, client)
-	sc := scanner.New(ctx, database, client, imgCache, cfg.MoviesDir, cfg.TVDir)
-	tc, err := transcode.New(cfg.FFmpegPath, cfg.FFprobePath)
-	if err != nil {
+	// HLS transcoding for MKVs, when ffmpeg is available. The scanner builds
+	// each MKV's keyframe index so playback can start straight away.
+	var hls *transcode.HLS
+	var indexer scanner.Indexer
+	if tc, err := transcode.New(cfg.FFmpegPath, cfg.FFprobePath); err != nil {
 		log.Printf("transcoding disabled, MKV files will be served as-is: %v", err)
-		tc = nil
+	} else {
+		store := transcode.NewStore(database, tc)
+		indexer = store
+		if hls, err = transcode.NewHLS(store, tc, filepath.Join(cfg.CacheDir, "hls")); err != nil {
+			log.Fatalf("hls: %v", err)
+		}
+		defer hls.Close()
 	}
-	srv := server.New(database, sc, imgCache, web.Dist(), tc)
+	sc := scanner.New(ctx, database, client, imgCache, indexer, cfg.MoviesDir, cfg.TVDir)
+	srv := server.New(database, sc, imgCache, web.Dist(), hls)
 
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,

@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, episodeCode } from "../api";
-import { TranscodedVideo } from "../components/TranscodedVideo";
+import { HlsVideo } from "../components/HlsVideo";
 import { useFetch } from "../useFetch";
 
 function Video({ fileId }: { fileId: number }) {
@@ -9,7 +9,7 @@ function Video({ fileId }: { fileId: number }) {
 
   if (error) return <p role="alert">{error}</p>;
   if (loading || !playback) return <p>Loading…</p>;
-  if (playback.mode === "transcode") return <TranscodedVideo fileId={fileId} initial={playback} />;
+  if (playback.mode === "hls") return <HlsVideo src={playback.url} />;
   return <video className="player-video" src={playback.url} controls autoPlay preload="metadata" />;
 }
 

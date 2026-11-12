@@ -65,7 +65,7 @@ function ScanControl({ onFinished }: { onFinished: () => void }) {
         </span>
       ) : status?.finishedAt ? (
         <span>
-          Last scan: {status.filesLinked} linked, {status.filesIgnored} ignored, {status.filesRemoved} removed
+          Last scan: {status.filesLinked} linked, {status.filesIgnored} ignored, {status.filesRemoved} removed, {status.filesIndexed} indexed
           {status.errors.length > 0 ? `, ${status.errors.length} errors` : ""}
         </span>
       ) : null}

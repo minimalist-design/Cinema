@@ -68,19 +68,16 @@ export interface ScanStatus {
   filesRemoved: number;
   moviesAdded: number;
   showsAdded: number;
+  filesIndexed: number;
   ignored: string[];
   errors: string[];
 }
 
-// How to play a file. "direct" files are served as-is with range support and
-// use the browser's native controls. "transcode" streams can't be seeked by
-// the browser: seek by asking for a new Playback with a start time, then add
-// `start` to the video element's currentTime.
+// How to play a file. "direct" files are served as-is (with range support);
+// "hls" ones are transcoded on the server and streamed as HLS.
 export interface Playback {
-  mode: "direct" | "transcode";
+  mode: "direct" | "hls";
   url: string;
-  start: number;
-  duration: number | null;
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -99,7 +96,7 @@ export const api = {
   episode: (id: string) => request<Episode>(`/api/episodes/${id}`),
   scanStatus: () => request<ScanStatus>("/api/scan"),
   startScan: () => request<ScanStatus>("/api/scan", { method: "POST" }),
-  playback: (fileId: number, start = 0) => request<Playback>(`/api/playback/${fileId}?start=${start.toFixed(3)}`),
+  playback: (fileId: number) => request<Playback>(`/api/playback/${fileId}`),
 };
 
 export const episodeCode = (season: number, episode: number) =>

@@ -37,8 +37,17 @@ type Status struct {
 	FilesRemoved int        `json:"filesRemoved"`
 	MoviesAdded  int        `json:"moviesAdded"`
 	ShowsAdded   int        `json:"showsAdded"`
+	FilesIndexed int        `json:"filesIndexed"`
 	Ignored      []string   `json:"ignored"`
 	Errors       []string   `json:"errors"`
+}
+
+// Indexer prepares linked files for playback after a scan (see
+// transcode.Store).
+type Indexer interface {
+	// IndexLibrary indexes the files that need it, returning how many it
+	// indexed and an error per file that failed.
+	IndexLibrary(ctx context.Context) (indexed int, errs []error)
 }
 
 type Scanner struct {
@@ -46,6 +55,7 @@ type Scanner struct {
 	db        *sql.DB
 	tmdb      *tmdb.Client
 	images    *images.Cache
+	indexer   Indexer // nil to skip indexing
 	moviesDir string
 	tvDir     string
 
@@ -53,8 +63,8 @@ type Scanner struct {
 	status Status
 }
 
-func New(ctx context.Context, db *sql.DB, client *tmdb.Client, img *images.Cache, moviesDir, tvDir string) *Scanner {
-	return &Scanner{ctx: ctx, db: db, tmdb: client, images: img, moviesDir: moviesDir, tvDir: tvDir}
+func New(ctx context.Context, db *sql.DB, client *tmdb.Client, img *images.Cache, indexer Indexer, moviesDir, tvDir string) *Scanner {
+	return &Scanner{ctx: ctx, db: db, tmdb: client, images: img, indexer: indexer, moviesDir: moviesDir, tvDir: tvDir}
 }
 
 // Status returns a snapshot of the scan status.
@@ -89,8 +99,8 @@ func (s *Scanner) Start(refresh bool) bool {
 				st.Running, st.FinishedAt, st.Phase = false, &done, "done"
 			})
 			st := s.Status()
-			log.Printf("scan finished: %d seen, %d linked, %d ignored, %d removed, %d errors",
-				st.FilesSeen, st.FilesLinked, st.FilesIgnored, st.FilesRemoved, len(st.Errors))
+			log.Printf("scan finished: %d seen, %d linked, %d ignored, %d removed, %d indexed, %d errors",
+				st.FilesSeen, st.FilesLinked, st.FilesIgnored, st.FilesRemoved, st.FilesIndexed, len(st.Errors))
 		}()
 		s.run(s.ctx, refresh)
 	}()
@@ -174,6 +184,15 @@ func (s *Scanner) run(ctx context.Context, refresh bool) {
 	} else {
 		seen := s.scanTV(ctx, files, known, refresh)
 		s.removeMissing(ctx, "tv", seen)
+	}
+
+	if s.indexer != nil {
+		s.update(func(st *Status) { st.Phase = "indexing" })
+		n, errs := s.indexer.IndexLibrary(ctx)
+		s.update(func(st *Status) { st.FilesIndexed = n })
+		for _, err := range errs {
+			s.addError(err.Error())
+		}
 	}
 }
 

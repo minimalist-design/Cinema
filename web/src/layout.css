@@ -136,39 +136,3 @@ video {
   width: 100%;
   max-height: 80vh;
 }
-
-.transcoded-player {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.transcoded-player:fullscreen {
-  justify-content: center;
-}
-
-.transcoded-player:fullscreen .player-video {
-  flex: 1;
-  min-height: 0;
-  max-height: none;
-}
-
-.player-controls {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 12px;
-}
-
-.player-time {
-  white-space: nowrap;
-}
-
-.player-seek {
-  flex: 1 1 240px;
-  min-width: 0;
-}
-
-.player-volume {
-  width: 96px;
-}

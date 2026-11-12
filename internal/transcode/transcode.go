@@ -1,15 +1,17 @@
-// Package transcode turns files that browsers can't play directly (MKV) into
-// a fragmented MP4 stream with ffmpeg, on the fly.
+// Package transcode streams files that browsers can't play directly (MKV)
+// as HLS, transcoding them on the fly with ffmpeg.
 //
 // Streams that browsers already support are copied rather than re-encoded:
 // H.264 (8-bit 4:2:0) video and AAC/MP3 audio. Everything else is encoded to
 // H.264 + stereo AAC. Copying makes most MKVs (H.264 with AC3/DTS audio) cost
 // almost no CPU.
 //
-// The output isn't seekable byte-wise, so seeking is done by starting a new
-// stream at a time offset. When video is copied, a stream can only start on
-// a keyframe, so StartFor reports where a stream asked to start at t will
-// actually begin; the player uses that as its time offset.
+// An HLS playlist lists every segment of the file up front, so the player
+// knows the duration and can seek natively. That requires fixed segment
+// boundaries. Re-encoded video gets a keyframe forced every SegmentLength
+// seconds. Copied video can only be cut on its existing keyframes, so each
+// file has an Index with a keyframe near every SegmentLength seconds, built
+// once (normally during the library scan) and stored in the database.
 package transcode
 
 import (
@@ -18,28 +20,34 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
-	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 )
 
-// Transcoder runs ffprobe and ffmpeg. The zero value is not usable; use New.
-type Transcoder struct {
-	ffmpeg, ffprobe string
+// SegmentLength is the target HLS segment duration in seconds.
+const SegmentLength = 6.0
 
-	mu    sync.Mutex
-	cache map[string]cacheEntry
+// tsOffset is added to every timestamp in the MPEG-TS segments. Players
+// align the segments' timestamps with the playlist, so its value doesn't
+// matter as long as it's the same in every segment.
+const tsOffset = 10.0
+
+// transcodeExts are containers browsers can't play natively.
+var transcodeExts = map[string]bool{".mkv": true}
+
+// NeedsTranscode reports whether the file at path is streamed through HLS
+// rather than served as-is.
+func NeedsTranscode(path string) bool {
+	return transcodeExts[strings.ToLower(filepath.Ext(path))]
 }
 
-type cacheEntry struct {
-	size  int64
-	mtime time.Time
-	info  *Info
+// Transcoder runs ffprobe and ffmpeg.
+type Transcoder struct {
+	ffmpeg, ffprobe string
 }
 
 // New returns a Transcoder for the given ffmpeg and ffprobe binaries (names
@@ -52,7 +60,7 @@ func New(ffmpeg, ffprobe string) (*Transcoder, error) {
 	if ffprobe, err = exec.LookPath(ffprobe); err != nil {
 		return nil, fmt.Errorf("ffprobe: %w", err)
 	}
-	return &Transcoder{ffmpeg: ffmpeg, ffprobe: ffprobe, cache: map[string]cacheEntry{}}, nil
+	return &Transcoder{ffmpeg: ffmpeg, ffprobe: ffprobe}, nil
 }
 
 // Stream describes one stream of a media file.
@@ -60,63 +68,83 @@ type Stream struct {
 	Index    int    `json:"index"`
 	Type     string `json:"codec_type"`
 	Codec    string `json:"codec_name"`
-	PixFmt   string `json:"pix_fmt"`
-	Width    int    `json:"width"`
-	Height   int    `json:"height"`
-	Channels int    `json:"channels"`
+	PixFmt   string `json:"pix_fmt,omitempty"`
+	Width    int    `json:"width,omitempty"`
+	Height   int    `json:"height,omitempty"`
+	Channels int    `json:"channels,omitempty"`
 	// Disposition flags, e.g. "default" or "attached_pic".
-	Disposition map[string]int `json:"disposition"`
+	Disposition map[string]int `json:"disposition,omitempty"`
 }
 
-// Info is what ffprobe reports about a file, reduced to what playback needs.
-type Info struct {
-	Duration  float64 // seconds
-	StartTime float64 // container start timestamp, seconds
-	Video     *Stream // nil if the file has no video
-	Audio     *Stream // nil if the file has no audio
+// Index is what playback needs to know about a file.
+type Index struct {
+	Duration  float64 `json:"duration"`  // seconds
+	StartTime float64 `json:"startTime"` // container start timestamp, seconds
+	Video     *Stream `json:"video"`     // nil if the file has no video
+	Audio     *Stream `json:"audio"`     // nil if the file has no audio
+	// Keyframes are video keyframe times (seconds from StartTime), at most
+	// one per SegmentLength. Only set when video is copied.
+	Keyframes []float64 `json:"keyframes,omitempty"`
 }
 
 // CopyVideo reports whether the video stream can be passed through as is.
-func (i *Info) CopyVideo() bool {
-	v := i.Video
+func (ix *Index) CopyVideo() bool {
+	v := ix.Video
 	return v != nil && v.Codec == "h264" && (v.PixFmt == "yuv420p" || v.PixFmt == "yuvj420p")
 }
 
 // CopyAudio reports whether the audio stream can be passed through as is.
-func (i *Info) CopyAudio() bool {
-	a := i.Audio
+func (ix *Index) CopyAudio() bool {
+	a := ix.Audio
 	return a != nil && (a.Codec == "aac" || a.Codec == "mp3")
 }
 
-// Probe returns information about the file at path. Results are cached
-// until the file's size or modification time changes.
-func (t *Transcoder) Probe(ctx context.Context, path string) (*Info, error) {
-	st, err := os.Stat(path)
-	if err != nil {
-		return nil, err
+// Segments returns the start time of each HLS segment. Segment i covers
+// [starts[i], starts[i+1]), and the last one runs to Duration.
+func (ix *Index) Segments() []float64 {
+	starts := []float64{0}
+	last := func() float64 { return starts[len(starts)-1] }
+	// Don't leave a final segment shorter than a second.
+	end := ix.Duration - 1
+	if ix.CopyVideo() {
+		// Cut on keyframes, skipping any that would make a segment shorter
+		// than half the target length.
+		for _, kf := range ix.Keyframes {
+			if kf >= last()+SegmentLength/2 && kf <= end {
+				starts = append(starts, kf)
+			}
+		}
+		return starts
 	}
-	t.mu.Lock()
-	e, ok := t.cache[path]
-	t.mu.Unlock()
-	if ok && e.size == st.Size() && e.mtime.Equal(st.ModTime()) {
-		return e.info, nil
+	for t := SegmentLength; t <= end; t += SegmentLength {
+		starts = append(starts, t)
 	}
+	return starts
+}
 
+// BuildIndex probes the file at path and, when its video will be copied,
+// finds its keyframes.
+func (t *Transcoder) BuildIndex(ctx context.Context, path string) (*Index, error) {
 	out, err := t.run(ctx, t.ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path)
 	if err != nil {
 		return nil, err
 	}
-	info, err := parseProbe(out)
+	ix, err := parseProbe(out)
 	if err != nil {
 		return nil, fmt.Errorf("ffprobe %s: %w", path, err)
 	}
-	t.mu.Lock()
-	t.cache[path] = cacheEntry{size: st.Size(), mtime: st.ModTime(), info: info}
-	t.mu.Unlock()
-	return info, nil
+	if ix.Duration <= 0 {
+		return nil, fmt.Errorf("ffprobe %s: unknown duration", path)
+	}
+	if ix.CopyVideo() {
+		if ix.Keyframes, err = t.keyframes(ctx, path, ix); err != nil {
+			return nil, err
+		}
+	}
+	return ix, nil
 }
 
-func parseProbe(data []byte) (*Info, error) {
+func parseProbe(data []byte) (*Index, error) {
 	var raw struct {
 		Streams []Stream `json:"streams"`
 		Format  struct {
@@ -127,83 +155,88 @@ func parseProbe(data []byte) (*Info, error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
-	info := &Info{}
-	info.Duration, _ = strconv.ParseFloat(raw.Format.Duration, 64)
-	info.StartTime, _ = strconv.ParseFloat(raw.Format.StartTime, 64)
+	ix := &Index{}
+	ix.Duration, _ = strconv.ParseFloat(raw.Format.Duration, 64)
+	ix.StartTime, _ = strconv.ParseFloat(raw.Format.StartTime, 64)
 	for i := range raw.Streams {
 		s := &raw.Streams[i]
 		switch s.Type {
 		case "video":
 			// Skip cover art, which MKVs store as an attached picture stream.
-			if info.Video == nil && s.Disposition["attached_pic"] == 0 {
-				info.Video = s
+			if ix.Video == nil && s.Disposition["attached_pic"] == 0 {
+				ix.Video = s
 			}
 		case "audio":
 			// The first audio stream, unless a later one is flagged default.
-			if info.Audio == nil || (s.Disposition["default"] == 1 && info.Audio.Disposition["default"] == 0) {
-				info.Audio = s
+			if ix.Audio == nil || (s.Disposition["default"] == 1 && ix.Audio.Disposition["default"] == 0) {
+				ix.Audio = s
 			}
 		}
 	}
-	if info.Video == nil && info.Audio == nil {
+	if ix.Video == nil && ix.Audio == nil {
 		return nil, errors.New("no audio or video streams")
 	}
-	return info, nil
+	return ix, nil
 }
 
-// StartFor returns the time (seconds from the start of the file) at which a
-// stream requested to start at `at` really begins. When video is re-encoded
-// that's `at` itself; when it's copied it's the keyframe at or before `at`.
-func (t *Transcoder) StartFor(ctx context.Context, path string, info *Info, at float64) float64 {
-	at = math.Max(0, at)
-	if info.Duration > 0 {
-		at = math.Min(at, info.Duration)
+// keyframes finds the keyframe at or before every multiple of SegmentLength.
+// Rather than reading every packet of the file, ffprobe seeks to each point
+// (using the MKV's cue index, so only a little data is read per seek) and
+// reports the first packet there, which is the keyframe the seek landed on.
+func (t *Transcoder) keyframes(ctx context.Context, path string, ix *Index) ([]float64, error) {
+	var intervals []string
+	for at := 0.0; at < ix.Duration; at += SegmentLength {
+		intervals = append(intervals, fmt.Sprintf("%.3f%%+#1", at+ix.StartTime))
 	}
-	if at == 0 || !info.CopyVideo() {
-		return at
-	}
-	// read_intervals seeks the same way ffmpeg's -ss does (to the keyframe at
-	// or before the target, using absolute timestamps), then reads a few packets.
 	out, err := t.run(ctx, t.ffprobe, "-v", "error",
-		"-read_intervals", fmt.Sprintf("%.3f%%+#16", at+info.StartTime),
-		"-select_streams", strconv.Itoa(info.Video.Index),
+		"-read_intervals", strings.Join(intervals, ","),
+		"-select_streams", strconv.Itoa(ix.Video.Index),
 		"-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", path)
 	if err != nil {
-		return at
+		return nil, err
 	}
+	return parseKeyframes(out, ix.StartTime), nil
+}
+
+func parseKeyframes(out []byte, startTime float64) []float64 {
+	var kfs []float64
 	for _, line := range strings.Split(string(out), "\n") {
 		pts, flags, ok := strings.Cut(strings.TrimSpace(line), ",")
 		if !ok || !strings.HasPrefix(flags, "K") {
 			continue
 		}
 		if kf, err := strconv.ParseFloat(pts, 64); err == nil {
-			return math.Max(0, kf-info.StartTime)
+			kfs = append(kfs, math.Round((kf-startTime)*1000)/1000)
 		}
 	}
-	return at
+	slices.Sort(kfs)
+	return slices.Compact(kfs)
 }
 
-// Args returns the ffmpeg arguments that write a fragmented MP4 of the file
-// to stdout, starting at `start` seconds from the beginning of the file.
-func Args(path string, info *Info, start float64) []string {
+// segmentArgs returns the ffmpeg arguments that write the file's HLS
+// segments as MPEG-TS files <dir>/<n>.ts, starting with segment first.
+//
+// Every run uses the file's own timestamps (-copyts), so a run restarted at
+// any segment produces segments that line up with those of earlier runs.
+func segmentArgs(path string, ix *Index, starts []float64, first int, dir string) []string {
 	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error"}
-	if start > 0 {
-		ss := start
-		if info.CopyVideo() {
+	// -ss counts from the file's start time, like the segment start times.
+	if first > 0 {
+		if ix.CopyVideo() {
 			// Copied video starts at the keyframe at or before the seek
-			// target, and the output's time zero is that keyframe. ffmpeg
-			// seeks ~0.13s before -ss for video with B-frames, so -ss exactly
-			// on a keyframe (as StartFor returns) would land on the previous
-			// one. Aim a little past it instead.
-			ss += 0.2
+			// target. ffmpeg seeks ~0.13s before -ss for video with
+			// B-frames, so aim a little past the keyframe to land on it.
+			// Keep the audio from there too rather than trimming it.
+			args = append(args, "-ss", ffTime(starts[first]+0.2), "-noaccurate_seek")
+		} else {
+			args = append(args, "-ss", ffTime(starts[first]))
 		}
-		args = append(args, "-ss", strconv.FormatFloat(ss, 'f', 3, 64))
 	}
-	args = append(args, "-i", path)
+	args = append(args, "-copyts", "-i", path)
 
-	if v := info.Video; v != nil {
+	if v := ix.Video; v != nil {
 		args = append(args, "-map", "0:"+strconv.Itoa(v.Index))
-		if info.CopyVideo() {
+		if ix.CopyVideo() {
 			args = append(args, "-c:v", "copy")
 		} else {
 			args = append(args,
@@ -211,43 +244,54 @@ func Args(path string, info *Info, start float64) []string {
 				"-pix_fmt", "yuv420p",
 				// Cap at 1080p so real-time encoding stays feasible.
 				"-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-				// Frequent keyframes so each fragment is short and playback starts quickly.
-				"-force_key_frames", "expr:gte(t,n_forced*2)")
+				// A keyframe at every segment boundary. t counts from this
+				// run's start, which is itself a boundary.
+				"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%g)", SegmentLength))
 		}
 	}
-	if a := info.Audio; a != nil {
+	if a := ix.Audio; a != nil {
 		args = append(args, "-map", "0:"+strconv.Itoa(a.Index))
-		if info.CopyAudio() {
+		if ix.CopyAudio() {
 			args = append(args, "-c:a", "copy")
 		} else {
 			args = append(args, "-c:a", "aac", "-ac", "2", "-b:a", "192k")
 		}
 	}
 
+	// Split points, relative to where this run starts. A final one past the
+	// end stops the segment muxer from falling back to its 2s default.
+	var times []string
+	for _, s := range starts[first+1:] {
+		times = append(times, ffTime(s-starts[first]))
+	}
+	times = append(times, ffTime(ix.Duration-starts[first]+3600))
+
 	return append(args,
 		"-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1",
 		"-max_muxing_queue_size", "1024",
-		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
-		"-f", "mp4", "pipe:1")
+		// Timestamps must be identical whichever segment a run starts at,
+		// so nothing may shift them depending on the first packet: no
+		// shifting to zero, and the MPEG-TS muxer keeps them as is
+		// (mpegts_copyts). A fixed offset keeps them positive instead,
+		// since B-frames give the first video frames negative DTS.
+		"-avoid_negative_ts", "disabled",
+		"-output_ts_offset", ffTime(tsOffset),
+		"-f", "segment", "-segment_format", "mpegts",
+		"-segment_format_options", "mpegts_copyts=1",
+		// One MPEG-TS muxer for all segments, so continuity counters carry
+		// on from one segment to the next. The segment muxer still starts
+		// each segment with the PAT/PMT tables, so each plays on its own.
+		"-individual_header_trailer", "0",
+		"-segment_times", strings.Join(times, ","),
+		// Tolerance for rounding in the split points.
+		"-segment_time_delta", "0.25",
+		"-segment_start_number", strconv.Itoa(first),
+		// Print each segment's name to stdout once it's complete.
+		"-segment_list", "pipe:1", "-segment_list_type", "flat",
+		filepath.Join(dir, "%d.ts"))
 }
 
-// Transcode writes a fragmented MP4 of the file to w, starting at `start`
-// seconds (use StartFor to pick it). It runs until the file ends, w fails or
-// ctx is cancelled; cancellation isn't reported as an error.
-func (t *Transcoder) Transcode(ctx context.Context, w io.Writer, path string, info *Info, start float64) error {
-	cmd := exec.CommandContext(ctx, t.ffmpeg, Args(path, info, start)...)
-	cmd.Stdout = w
-	var stderr tailBuffer
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if ctx.Err() != nil {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("ffmpeg %s: %w: %s", path, err, strings.TrimSpace(stderr.String()))
-	}
-	return nil
-}
+func ffTime(s float64) string { return strconv.FormatFloat(s, 'f', 3, 64) }
 
 func (t *Transcoder) run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	var stdout bytes.Buffer
@@ -255,7 +299,7 @@ func (t *Transcoder) run(ctx context.Context, name string, args ...string) ([]by
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("%s: %w: %s", filepath.Base(name), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.Bytes(), nil
 }
