@@ -110,7 +110,7 @@ func TestSegmentArgs(t *testing.T) {
 	starts := []float64{0, 6, 12.5, 18}
 	args := strings.Join(segmentArgs("/m/a.mkv", ix, starts, 0, "/tmp/s"), " ")
 	for _, want := range []string{"-copyts -i /m/a.mkv", "-map 0:0 -c:v copy", "-map 0:2 -c:a copy", "-sn",
-		"-avoid_negative_ts disabled -output_ts_offset 10.000", "-segment_format_options mpegts_copyts=1 -individual_header_trailer 0",
+		"-avoid_negative_ts disabled -output_ts_offset 10.000", "-segment_format_options mpegts_copyts=1:flush_packets=1 -individual_header_trailer 0",
 		"-segment_times 6.000,12.500,18.000,9000.250", "-segment_start_number 0",
 		"-segment_list pipe:1 -segment_list_type flat", "/tmp/s/%d.ts"} {
 		if !strings.Contains(args, want) {
@@ -453,5 +453,40 @@ func TestHLSSeekSupersedesWaiting(t *testing.T) {
 	s.mu.Unlock()
 	if first != last {
 		t.Errorf("job restarted at %d, want %d", first, last)
+	}
+}
+
+// TestHLSSegmentsCompleteWhenServed checks that a segment is fully written
+// when Segment returns it, by comparing its size then with its size once
+// ffmpeg has exited.
+func TestHLSSegmentsCompleteWhenServed(t *testing.T) {
+	_, database, _, h := newTestHLS(t)
+	ctx := context.Background()
+	id, _ := makeMKV(t, database, "copy.mkv", copyArgs...)
+	sizes := map[string]int64{}
+	for n := 0; ; n++ {
+		path, err := h.Segment(ctx, id, "complete-session", n)
+		if err == ErrBadSegment {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sizes[path] = st.Size()
+	}
+	h.mu.Lock()
+	s := h.sessions["complete-session"]
+	h.mu.Unlock()
+	s.mu.Lock()
+	j := s.job
+	s.mu.Unlock()
+	<-j.done
+	for path, size := range sizes {
+		if st, err := os.Stat(path); err != nil || st.Size() != size {
+			t.Errorf("%s was %d bytes when served, %v later (%v)", filepath.Base(path), size, st.Size(), err)
+		}
 	}
 }

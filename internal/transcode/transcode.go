@@ -277,7 +277,11 @@ func segmentArgs(path string, ix *Index, starts []float64, first int, dir string
 		"-avoid_negative_ts", "disabled",
 		"-output_ts_offset", ffTime(tsOffset),
 		"-f", "segment", "-segment_format", "mpegts",
-		"-segment_format_options", "mpegts_copyts=1",
+		// flush_packets: write every packet straight to the file. With a
+		// shared muxer, ffmpeg announces a segment (on the segment list)
+		// before the end of it has left its write buffer, so a segment
+		// served right away could be missing its last frames.
+		"-segment_format_options", "mpegts_copyts=1:flush_packets=1",
 		// One MPEG-TS muxer for all segments, so continuity counters carry
 		// on from one segment to the next. The segment muxer still starts
 		// each segment with the PAT/PMT tables, so each plays on its own.

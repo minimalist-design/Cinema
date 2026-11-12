@@ -341,6 +341,12 @@ func TestEndToEnd(t *testing.T) {
 	if ep.NextEpisodeID != nil {
 		t.Errorf("last episode has next = %v", *ep.NextEpisodeID)
 	}
+	// Empty lists are [] rather than null.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/scan", nil))
+	if body := rec.Body.String(); !strings.Contains(body, `"errors":[]`) || strings.Contains(body, "null") {
+		t.Errorf("scan status = %s", body)
+	}
 	if code := getJSON(t, h, "/api/movies/999", nil); code != 404 {
 		t.Errorf("missing movie code = %d", code)
 	}
@@ -348,7 +354,7 @@ func TestEndToEnd(t *testing.T) {
 	// ---- streaming with range requests
 	req := httptest.NewRequest("GET", "/api/stream/"+itoa(movie.FileID), nil)
 	req.Header.Set("Range", "bytes=10-19")
-	rec := httptest.NewRecorder()
+	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusPartialContent || rec.Body.String() != movieContent[10:20] || rec.Header().Get("Content-Type") != "video/mp4" {
 		t.Errorf("range stream: %d %q %q", rec.Code, rec.Body.String(), rec.Header().Get("Content-Type"))

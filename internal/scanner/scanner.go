@@ -72,8 +72,10 @@ func (s *Scanner) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.status
-	st.Ignored = append([]string(nil), st.Ignored...)
-	st.Errors = append([]string(nil), st.Errors...)
+	// Copies, never nil: nil slices encode as JSON null, and the UI expects
+	// arrays.
+	st.Ignored = append([]string{}, st.Ignored...)
+	st.Errors = append([]string{}, st.Errors...)
 	return st
 }
 
