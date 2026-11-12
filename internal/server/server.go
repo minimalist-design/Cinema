@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 
 	"cinema/internal/images"
 	"cinema/internal/scanner"
+	"cinema/internal/subtitles"
 	"cinema/internal/transcode"
 )
 
@@ -27,13 +29,19 @@ type Server struct {
 	scanner *scanner.Scanner
 	images  *images.Cache
 	web     fs.FS
-	// hls is nil when ffmpeg isn't available; files are then always served
-	// as-is.
-	hls *transcode.HLS
+	Media
 }
 
-func New(db *sql.DB, sc *scanner.Scanner, img *images.Cache, web fs.FS, hls *transcode.HLS) *Server {
-	return &Server{db: db, scanner: sc, images: img, web: web, hls: hls}
+// Media holds the parts that need ffmpeg. They're all nil when it isn't
+// available: files are then served as-is, without subtitles.
+type Media struct {
+	Store     *transcode.Store
+	HLS       *transcode.HLS
+	Subtitles *subtitles.Service
+}
+
+func New(db *sql.DB, sc *scanner.Scanner, img *images.Cache, web fs.FS, media Media) *Server {
+	return &Server{db: db, scanner: sc, images: img, web: web, Media: media}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -46,6 +54,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/playback/{id}", s.playback)
 	mux.HandleFunc("GET /api/hls/{id}/{session}/index.m3u8", s.hlsPlaylist)
 	mux.HandleFunc("GET /api/hls/{id}/{session}/{segment}", s.hlsSegment)
+	mux.HandleFunc("GET /api/subtitles/{id}/{track}", s.subtitle)
 	mux.HandleFunc("GET /api/scan", s.scanStatus)
 	mux.HandleFunc("POST /api/scan", s.startScan)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
@@ -340,17 +349,85 @@ func (s *Server) filePath(w http.ResponseWriter, r *http.Request) (string, bool)
 // playback tells the player how to play a file: "direct" files are served
 // as-is from /api/stream, "hls" ones are transcoded to HLS. Each HLS
 // playback gets its own session (and ffmpeg process) on the server.
+type subtitleTrack struct {
+	subtitles.Track
+	URL string `json:"url"`
+}
+
 func (s *Server) playback(w http.ResponseWriter, r *http.Request) {
 	p, ok := s.filePath(w, r)
 	if !ok {
 		return
 	}
 	id := r.PathValue("id")
-	if s.hls == nil || !transcode.NeedsTranscode(p) {
-		writeJSON(w, map[string]string{"mode": "direct", "url": "/api/stream/" + id})
+	out := struct {
+		Mode      string          `json:"mode"`
+		URL       string          `json:"url"`
+		Subtitles []subtitleTrack `json:"subtitles"`
+	}{Mode: "direct", URL: "/api/stream/" + id, Subtitles: []subtitleTrack{}}
+	if s.HLS != nil && transcode.NeedsTranscode(p) {
+		out.Mode, out.URL = "hls", "/api/hls/"+id+"/"+rand.Text()+"/index.m3u8"
+	}
+	if s.Subtitles != nil {
+		// Side files are listed even if the file can't be indexed.
+		fileID, _ := strconv.ParseInt(id, 10, 64) // validated by filePath
+		_, ix, err := s.Store.Get(r.Context(), fileID)
+		if err != nil {
+			log.Printf("index %s: %v", p, err)
+			ix = nil
+		}
+		for _, t := range s.Subtitles.Tracks(p, ix) {
+			out.Subtitles = append(out.Subtitles, subtitleTrack{t, "/api/subtitles/" + id + "/" + url.PathEscape(t.ID) + ".vtt"})
+		}
+	}
+	writeJSON(w, out)
+}
+
+// subtitle serves a subtitle track as WebVTT.
+func (s *Server) subtitle(w http.ResponseWriter, r *http.Request) {
+	if s.Subtitles == nil {
+		writeError(w, http.StatusNotImplemented, "subtitles unavailable: ffmpeg not found")
 		return
 	}
-	writeJSON(w, map[string]string{"mode": "hls", "url": "/api/hls/" + id + "/" + rand.Text() + "/index.m3u8"})
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	track, found := strings.CutSuffix(r.PathValue("track"), ".vtt")
+	if !found {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	p, ix, err := s.Store.Get(r.Context(), int64(id))
+	if errors.Is(err, transcode.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	} else if errors.Is(err, fs.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "file missing on disk; rescan the library")
+		return
+	} else if err != nil {
+		// Side files don't need the index.
+		log.Printf("index %d: %v", id, err)
+		if err := s.db.QueryRowContext(r.Context(), `SELECT path FROM files WHERE id = ?`, id).Scan(&p); err != nil {
+			serverError(w, err)
+			return
+		}
+		ix = nil
+	}
+	vtt, err := s.Subtitles.WebVTT(r.Context(), int64(id), p, ix, track)
+	switch {
+	case r.Context().Err() != nil:
+		return
+	case errors.Is(err, subtitles.ErrNotFound), errors.Is(err, fs.ErrNotExist):
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	case err != nil:
+		serverError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write(vtt)
 }
 
 func (s *Server) hlsPlaylist(w http.ResponseWriter, r *http.Request) {
@@ -358,7 +435,7 @@ func (s *Server) hlsPlaylist(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	pl, err := s.hls.Playlist(r.Context(), id)
+	pl, err := s.HLS.Playlist(r.Context(), id)
 	if err != nil {
 		hlsError(w, r, err)
 		return
@@ -379,7 +456,7 @@ func (s *Server) hlsSegment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
-	p, err := s.hls.Segment(r.Context(), id, r.PathValue("session"), n)
+	p, err := s.HLS.Segment(r.Context(), id, r.PathValue("session"), n)
 	if err != nil {
 		hlsError(w, r, err)
 		return
@@ -403,7 +480,7 @@ func (s *Server) hlsSegment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) hlsFileID(w http.ResponseWriter, r *http.Request) (int64, bool) {
-	if s.hls == nil {
+	if s.HLS == nil {
 		writeError(w, http.StatusNotImplemented, "transcoding unavailable: ffmpeg not found")
 		return 0, false
 	}

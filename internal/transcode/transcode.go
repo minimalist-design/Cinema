@@ -72,8 +72,10 @@ type Stream struct {
 	Width    int    `json:"width,omitempty"`
 	Height   int    `json:"height,omitempty"`
 	Channels int    `json:"channels,omitempty"`
-	// Disposition flags, e.g. "default" or "attached_pic".
+	// Disposition flags, e.g. "default", "forced" or "attached_pic".
 	Disposition map[string]int `json:"disposition,omitempty"`
+	// Only the "language" and "title" tags are kept.
+	Tags map[string]string `json:"tags,omitempty"`
 }
 
 // Index is what playback needs to know about a file.
@@ -82,8 +84,11 @@ type Index struct {
 	StartTime float64 `json:"startTime"` // container start timestamp, seconds
 	Video     *Stream `json:"video"`     // nil if the file has no video
 	Audio     *Stream `json:"audio"`     // nil if the file has no audio
+	// Subtitles are the file's subtitle streams, text and image based.
+	Subtitles []*Stream `json:"subtitles,omitempty"`
 	// Keyframes are video keyframe times (seconds from StartTime), at most
-	// one per SegmentLength. Only set when video is copied.
+	// one per SegmentLength. Only set for files streamed through HLS whose
+	// video is copied.
 	Keyframes []float64 `json:"keyframes,omitempty"`
 }
 
@@ -122,8 +127,11 @@ func (ix *Index) Segments() []float64 {
 	return starts
 }
 
-// BuildIndex probes the file at path and, when its video will be copied,
-// finds its keyframes.
+// FFmpeg returns the path of the ffmpeg binary.
+func (t *Transcoder) FFmpeg() string { return t.ffmpeg }
+
+// BuildIndex probes the file at path and, when it will be streamed through
+// HLS with its video copied, finds its keyframes.
 func (t *Transcoder) BuildIndex(ctx context.Context, path string) (*Index, error) {
 	out, err := t.run(ctx, t.ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path)
 	if err != nil {
@@ -136,7 +144,7 @@ func (t *Transcoder) BuildIndex(ctx context.Context, path string) (*Index, error
 	if ix.Duration <= 0 {
 		return nil, fmt.Errorf("ffprobe %s: unknown duration", path)
 	}
-	if ix.CopyVideo() {
+	if NeedsTranscode(path) && ix.CopyVideo() {
 		if ix.Keyframes, err = t.keyframes(ctx, path, ix); err != nil {
 			return nil, err
 		}
@@ -160,6 +168,13 @@ func parseProbe(data []byte) (*Index, error) {
 	ix.StartTime, _ = strconv.ParseFloat(raw.Format.StartTime, 64)
 	for i := range raw.Streams {
 		s := &raw.Streams[i]
+		tags := map[string]string{}
+		for k, v := range s.Tags {
+			if k = strings.ToLower(k); k == "language" || k == "title" {
+				tags[k] = v
+			}
+		}
+		s.Tags = tags
 		switch s.Type {
 		case "video":
 			// Skip cover art, which MKVs store as an attached picture stream.
@@ -171,6 +186,8 @@ func parseProbe(data []byte) (*Index, error) {
 			if ix.Audio == nil || (s.Disposition["default"] == 1 && ix.Audio.Disposition["default"] == 0) {
 				ix.Audio = s
 			}
+		case "subtitle":
+			ix.Subtitles = append(ix.Subtitles, s)
 		}
 	}
 	if ix.Video == nil && ix.Audio == nil {

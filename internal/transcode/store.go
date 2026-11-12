@@ -13,7 +13,7 @@ import (
 
 // indexVersion is stored with each index. Bump it when the Index format or
 // how it's built changes, so existing indexes are rebuilt.
-const indexVersion = 1
+const indexVersion = 2
 
 // ErrNotFound is returned for an unknown file id.
 var ErrNotFound = errors.New("file not found")
@@ -97,41 +97,46 @@ func (s *Store) ensure(ctx context.Context, fileID int64, path string) (ix *Inde
 	return ix, true, nil
 }
 
-// IndexLibrary indexes every linked file that will be streamed through HLS
-// and doesn't have an up-to-date index yet. It returns how many files it
+// File is a library file linked to a movie or episode.
+type File struct {
+	ID   int64
+	Path string
+}
+
+// LinkedFiles returns the files linked to a movie or episode.
+func (s *Store) LinkedFiles(ctx context.Context) ([]File, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, path FROM files WHERE movie_id IS NOT NULL OR episode_id IS NOT NULL ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var files []File
+	for rows.Next() {
+		var f File
+		if err := rows.Scan(&f.ID, &f.Path); err != nil {
+			return nil, err
+		}
+		files = append(files, f)
+	}
+	return files, rows.Err()
+}
+
+// IndexLibrary indexes every linked file that doesn't have an up-to-date
+// index yet. All files are indexed for their subtitle tracks; files
+// streamed through HLS also get their keyframes. It returns how many files it
 // indexed and an error per file that failed.
 func (s *Store) IndexLibrary(ctx context.Context) (indexed int, errs []error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, path FROM files WHERE movie_id IS NOT NULL OR episode_id IS NOT NULL ORDER BY id`)
+	files, err := s.LinkedFiles(ctx)
 	if err != nil {
 		return 0, []error{err}
 	}
-	type file struct {
-		id   int64
-		path string
-	}
-	var files []file
-	for rows.Next() {
-		var f file
-		if err := rows.Scan(&f.id, &f.path); err != nil {
-			rows.Close()
-			return 0, []error{err}
-		}
-		if NeedsTranscode(f.path) {
-			files = append(files, f)
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, []error{err}
-	}
-
 	for _, f := range files {
 		if ctx.Err() != nil {
 			return indexed, append(errs, ctx.Err())
 		}
-		_, built, err := s.ensure(ctx, f.id, f.path)
+		_, built, err := s.ensure(ctx, f.ID, f.Path)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("index %s: %w", f.path, err))
+			errs = append(errs, fmt.Errorf("index %s: %w", f.Path, err))
 		} else if built {
 			indexed++
 		}

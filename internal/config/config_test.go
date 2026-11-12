@@ -2,6 +2,7 @@ package config
 
 import (
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -36,6 +37,7 @@ func TestLoadExpandsHome(t *testing.T) {
 	t.Setenv("TV_DIR", "/srv/tv")
 	t.Setenv("DB_PATH", "~/cinema/cinema.db")
 	t.Setenv("CACHE_DIR", "")
+	t.Setenv("SUBTITLE_LANGUAGES", " eng, fre ,,")
 	c, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -43,5 +45,8 @@ func TestLoadExpandsHome(t *testing.T) {
 	if c.MoviesDir != filepath.Join(home, "Movies") || c.TVDir != "/srv/tv" ||
 		c.DBPath != filepath.Join(home, "cinema", "cinema.db") || c.CacheDir != "./data/cache" {
 		t.Errorf("config = %+v", c)
+	}
+	if !slices.Equal(c.SubtitleLanguages, []string{"eng", "fre"}) {
+		t.Errorf("subtitle languages = %q", c.SubtitleLanguages)
 	}
 }

@@ -69,6 +69,10 @@ export interface ScanStatus {
   moviesAdded: number;
   showsAdded: number;
   filesIndexed: number;
+  subtitlesExtracted: number;
+  // Progress through the current phase, when it reports any (0/0 otherwise).
+  phaseDone: number;
+  phaseTotal: number;
   ignored: string[];
   errors: string[];
 }
@@ -77,6 +81,20 @@ export interface ScanStatus {
 // "hls" ones are transcoded on the server and streamed as HLS.
 export interface Playback {
   mode: "direct" | "hls";
+  url: string;
+  subtitles: SubtitleTrack[];
+}
+
+// A text subtitle track, built into the file or from a side file, served
+// as WebVTT. At most one is marked default: the one to show at start.
+export interface SubtitleTrack {
+  id: string;
+  label: string;
+  language: string;
+  forced: boolean;
+  hearingImpaired: boolean;
+  external: boolean;
+  default: boolean;
   url: string;
 }
 

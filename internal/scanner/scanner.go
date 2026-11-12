@@ -38,8 +38,13 @@ type Status struct {
 	MoviesAdded  int        `json:"moviesAdded"`
 	ShowsAdded   int        `json:"showsAdded"`
 	FilesIndexed int        `json:"filesIndexed"`
-	Ignored      []string   `json:"ignored"`
-	Errors       []string   `json:"errors"`
+	// Files whose built-in subtitles were extracted.
+	SubtitlesExtracted int `json:"subtitlesExtracted"`
+	// Progress through the current phase, when it reports any.
+	PhaseDone  int      `json:"phaseDone"`
+	PhaseTotal int      `json:"phaseTotal"`
+	Ignored    []string `json:"ignored"`
+	Errors     []string `json:"errors"`
 }
 
 // Indexer prepares linked files for playback after a scan (see
@@ -50,12 +55,21 @@ type Indexer interface {
 	IndexLibrary(ctx context.Context) (indexed int, errs []error)
 }
 
+// SubtitleExtractor extracts built-in subtitles after a scan, so they're
+// ready at playback (see subtitles.Service).
+type SubtitleExtractor interface {
+	// ExtractLibrary extracts the files that need it, reporting progress,
+	// and returns how many it extracted and an error per file that failed.
+	ExtractLibrary(ctx context.Context, progress func(done, total int)) (extracted int, errs []error)
+}
+
 type Scanner struct {
 	ctx       context.Context
 	db        *sql.DB
 	tmdb      *tmdb.Client
 	images    *images.Cache
-	indexer   Indexer // nil to skip indexing
+	indexer   Indexer           // nil to skip indexing
+	subtitles SubtitleExtractor // nil to skip subtitle extraction
 	moviesDir string
 	tvDir     string
 
@@ -63,8 +77,8 @@ type Scanner struct {
 	status Status
 }
 
-func New(ctx context.Context, db *sql.DB, client *tmdb.Client, img *images.Cache, indexer Indexer, moviesDir, tvDir string) *Scanner {
-	return &Scanner{ctx: ctx, db: db, tmdb: client, images: img, indexer: indexer, moviesDir: moviesDir, tvDir: tvDir}
+func New(ctx context.Context, db *sql.DB, client *tmdb.Client, img *images.Cache, indexer Indexer, subs SubtitleExtractor, moviesDir, tvDir string) *Scanner {
+	return &Scanner{ctx: ctx, db: db, tmdb: client, images: img, indexer: indexer, subtitles: subs, moviesDir: moviesDir, tvDir: tvDir}
 }
 
 // Status returns a snapshot of the scan status.
@@ -101,8 +115,8 @@ func (s *Scanner) Start(refresh bool) bool {
 				st.Running, st.FinishedAt, st.Phase = false, &done, "done"
 			})
 			st := s.Status()
-			log.Printf("scan finished: %d seen, %d linked, %d ignored, %d removed, %d indexed, %d errors",
-				st.FilesSeen, st.FilesLinked, st.FilesIgnored, st.FilesRemoved, st.FilesIndexed, len(st.Errors))
+			log.Printf("scan finished: %d seen, %d linked, %d ignored, %d removed, %d indexed, %d with subtitles extracted, %d errors",
+				st.FilesSeen, st.FilesLinked, st.FilesIgnored, st.FilesRemoved, st.FilesIndexed, st.SubtitlesExtracted, len(st.Errors))
 		}()
 		s.run(s.ctx, refresh)
 	}()
@@ -192,6 +206,19 @@ func (s *Scanner) run(ctx context.Context, refresh bool) {
 		s.update(func(st *Status) { st.Phase = "indexing" })
 		n, errs := s.indexer.IndexLibrary(ctx)
 		s.update(func(st *Status) { st.FilesIndexed = n })
+		for _, err := range errs {
+			s.addError(err.Error())
+		}
+	}
+
+	// Last, as it can take long: it reads whole files. The library is
+	// already up to date by now.
+	if s.subtitles != nil {
+		s.update(func(st *Status) { st.Phase = "subtitles" })
+		n, errs := s.subtitles.ExtractLibrary(ctx, func(done, total int) {
+			s.update(func(st *Status) { st.PhaseDone, st.PhaseTotal = done, total })
+		})
+		s.update(func(st *Status) { st.SubtitlesExtracted, st.PhaseDone, st.PhaseTotal = n, 0, 0 })
 		for _, err := range errs {
 			s.addError(err.Error())
 		}

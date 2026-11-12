@@ -21,7 +21,8 @@ const probeJSON = `{
     {"index": 0, "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "width": 1920, "height": 1080, "disposition": {"default": 1}},
     {"index": 1, "codec_type": "audio", "codec_name": "ac3", "channels": 6, "disposition": {"default": 0}},
     {"index": 2, "codec_type": "audio", "codec_name": "aac", "channels": 2, "disposition": {"default": 1}},
-    {"index": 3, "codec_type": "subtitle", "codec_name": "subrip", "disposition": {"default": 1}},
+    {"index": 3, "codec_type": "subtitle", "codec_name": "subrip", "disposition": {"default": 1},
+     "tags": {"language": "fre", "title": "FR Forced", "DURATION": "01:30:00.000000000", "ENCODER": "x"}},
     {"index": 4, "codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}}
   ],
   "format": {"duration": "5400.250000", "start_time": "0.007000"}
@@ -40,6 +41,10 @@ func TestParseProbe(t *testing.T) {
 	}
 	if ix.Audio == nil || ix.Audio.Index != 2 || !ix.CopyAudio() {
 		t.Errorf("audio should be the default AAC track, got %+v", ix.Audio)
+	}
+	if len(ix.Subtitles) != 1 || ix.Subtitles[0].Index != 3 || ix.Subtitles[0].Codec != "subrip" ||
+		ix.Subtitles[0].Tags["language"] != "fre" || ix.Subtitles[0].Tags["title"] != "FR Forced" || len(ix.Subtitles[0].Tags) != 2 {
+		t.Errorf("subtitles = %+v", ix.Subtitles)
 	}
 
 	// Cover art only: no usable video.
@@ -343,18 +348,26 @@ func TestStore(t *testing.T) {
 	_, database, store, _ := newTestHLS(t)
 	ctx := context.Background()
 	id, path := makeMKV(t, database, "copy.mkv", copyArgs...)
-	// Linked files are indexed by IndexLibrary; non-MKVs are skipped.
+	mp4ID, _ := makeMKV(t, database, "clip.mp4", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24", "-t", "2", "-c:v", "libx264")
+	makeMKV(t, database, "unlinked.mkv", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24", "-t", "2", "-c:v", "libx264")
+	// Linked files are indexed by IndexLibrary, MP4s included (for their
+	// subtitles); only MKVs get keyframes.
 	if _, err := database.Exec(`INSERT INTO movies (id, title, raw_json, fetched_at) VALUES (1, 'x', '{}', '')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.Exec(`UPDATE files SET movie_id = 1 WHERE id = ?`, id); err != nil {
+	if _, err := database.Exec(`UPDATE files SET movie_id = 1 WHERE id IN (?, ?)`, id, mp4ID); err != nil {
 		t.Fatal(err)
 	}
-	database.Exec(`INSERT INTO files (path, library, size, mtime, movie_id, added_at, updated_at) VALUES ('/x.mp4', 'movie', 1, 1, 1, '', '')`)
 
 	n, errs := store.IndexLibrary(ctx)
-	if n != 1 || len(errs) != 0 {
+	if n != 2 || len(errs) != 0 {
 		t.Fatalf("IndexLibrary = %d, %v", n, errs)
+	}
+	if _, ix, err := store.Get(ctx, mp4ID); err != nil || ix.Keyframes != nil || ix.Video == nil {
+		t.Errorf("mp4 index = %+v, %v", ix, err)
+	}
+	if _, ix, err := store.Get(ctx, id); err != nil || len(ix.Keyframes) == 0 {
+		t.Errorf("mkv index = %+v, %v", ix, err)
 	}
 	if n, errs = store.IndexLibrary(ctx); n != 0 || len(errs) != 0 {
 		t.Errorf("second IndexLibrary = %d, %v", n, errs)

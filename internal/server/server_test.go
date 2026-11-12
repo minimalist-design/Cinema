@@ -19,6 +19,7 @@ import (
 	"cinema/internal/images"
 	"cinema/internal/scanner"
 	"cinema/internal/server"
+	"cinema/internal/subtitles"
 	"cinema/internal/tmdb"
 	"cinema/internal/transcode"
 )
@@ -221,7 +222,7 @@ func TestEndToEnd(t *testing.T) {
 	client := tmdb.New("test-token", "en-US")
 	client.BaseURL, client.ImageBaseURL = fake.URL, fake.URL+"/img"
 	img := images.New(filepath.Join(tmp, "cache"), database, client)
-	sc := scanner.New(context.Background(), database, client, img, nil, moviesDir, tvDir)
+	sc := scanner.New(context.Background(), database, client, img, nil, nil, moviesDir, tvDir)
 
 	st := sc.Run(context.Background(), false)
 	if len(st.Errors) > 0 {
@@ -280,7 +281,7 @@ func TestEndToEnd(t *testing.T) {
 	}
 
 	// ---- API
-	h := server.New(database, sc, img, fstest.MapFS{"index.html": {Data: []byte("<html>app</html>")}}, nil).Handler()
+	h := server.New(database, sc, img, fstest.MapFS{"index.html": {Data: []byte("<html>app</html>")}}, server.Media{}).Handler()
 
 	var lib struct {
 		Movies []struct {
@@ -402,8 +403,13 @@ func TestEndToEnd(t *testing.T) {
 }
 
 type playbackInfo struct {
-	Mode string `json:"mode"`
-	URL  string `json:"url"`
+	Mode      string `json:"mode"`
+	URL       string `json:"url"`
+	Subtitles []struct {
+		Label   string `json:"label"`
+		Default bool   `json:"default"`
+		URL     string `json:"url"`
+	} `json:"subtitles"`
 }
 
 // testPlayback checks that MP4s play directly and MKVs are streamed as HLS
@@ -416,7 +422,7 @@ func testPlayback(t *testing.T, database *sql.DB, sc *scanner.Scanner, img *imag
 	web := fstest.MapFS{}
 
 	// Without ffmpeg everything is served as-is.
-	h := server.New(database, sc, img, web, nil).Handler()
+	h := server.New(database, sc, img, web, server.Media{}).Handler()
 	var pb playbackInfo
 	getJSON(t, h, "/api/playback/"+itoa(mkvID), &pb)
 	if pb.Mode != "direct" || pb.URL != "/api/stream/"+itoa(mkvID) {
@@ -430,29 +436,69 @@ func testPlayback(t *testing.T, database *sql.DB, sc *scanner.Scanner, img *imag
 	if err != nil {
 		t.Skip("ffmpeg not installed:", err)
 	}
-	hls, err := transcode.NewHLS(transcode.NewStore(database, tc), tc, filepath.Join(t.TempDir(), "hls"))
+	store := transcode.NewStore(database, tc)
+	hls, err := transcode.NewHLS(store, tc, filepath.Join(t.TempDir(), "hls"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer hls.Close()
-	h = server.New(database, sc, img, web, hls).Handler()
+	subs, err := subtitles.New(tc.FFmpeg(), filepath.Join(t.TempDir(), "subtitles"), []string{"eng"}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subs.Close()
+	h = server.New(database, sc, img, web, server.Media{Store: store, HLS: hls, Subtitles: subs}).Handler()
 	getJSON(t, h, "/api/playback/"+itoa(mp4ID), &pb)
 	if pb.Mode != "direct" {
 		t.Errorf("mp4 playback = %+v", pb)
 	}
 
-	// Replace the placeholder episode with a real 8s MKV (H.264 + AC3).
-	cmd := exec.Command("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24",
-		"-f", "lavfi", "-i", "sine", "-t", "8", "-c:v", "libx264", "-g", "24", "-c:a", "ac3", "-f", "matroska", mkvPath)
+	// Replace the placeholder episode with a real 8s MKV (H.264 + AC3) with
+	// a French subtitle track, and add an English side file.
+	dir := filepath.Dir(mkvPath)
+	srt := filepath.Join(t.TempDir(), "fr.srt")
+	writeFile(t, srt, "1\n00:00:01,000 --> 00:00:02,000\nBonjour\n")
+	cmd := exec.Command("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-t", "8", "-i", "testsrc2=size=160x120:rate=24",
+		"-f", "lavfi", "-t", "8", "-i", "sine", "-i", srt, "-map", "0", "-map", "1", "-map", "2",
+		"-c:v", "libx264", "-g", "24", "-c:a", "ac3", "-c:s", "srt", "-metadata:s:s:0", "language=fre",
+		"-disposition:s:0", "default", "-f", "matroska", mkvPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("can't generate test media: %v: %s", err, out)
 	}
+	writeFile(t, filepath.Join(dir, "Test Show (2020) - s01e01 - Pilot.en.srt"), "1\n00:00:03,000 --> 00:00:04,000\nHello\n")
 	pb = playbackInfo{}
 	getJSON(t, h, "/api/playback/"+itoa(mkvID), &pb)
 	prefix := "/api/hls/" + itoa(mkvID) + "/"
 	if pb.Mode != "hls" || !strings.HasPrefix(pb.URL, prefix) || !strings.HasSuffix(pb.URL, "/index.m3u8") {
 		t.Fatalf("mkv playback = %+v", pb)
 	}
+	// English is preferred, so the side file is shown at start.
+	if len(pb.Subtitles) != 2 || pb.Subtitles[0].Label != "English" || !pb.Subtitles[0].Default ||
+		pb.Subtitles[1].Label != "French" || pb.Subtitles[1].Default {
+		t.Errorf("subtitles = %+v", pb.Subtitles)
+	}
+	for _, sub := range pb.Subtitles {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", sub.URL, nil))
+		want := map[string]string{"English": "Hello", "French": "Bonjour"}[sub.Label]
+		if rec.Code != 200 || rec.Header().Get("Content-Type") != "text/vtt; charset=utf-8" ||
+			!strings.HasPrefix(rec.Body.String(), "WEBVTT") || !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("%s: %d %q\n%s", sub.URL, rec.Code, rec.Header().Get("Content-Type"), rec.Body.String())
+		}
+	}
+	for _, u := range []string{"/api/subtitles/" + itoa(mkvID) + "/embedded-9.vtt", "/api/subtitles/" + itoa(mkvID) + "/file-de.srt.vtt",
+		"/api/subtitles/" + itoa(mkvID) + "/file-..%2F..%2Fetc%2Fpasswd.vtt", "/api/subtitles/999999/embedded-2.vtt"} {
+		if code := getJSON(t, h, u, nil); code != http.StatusNotFound {
+			t.Errorf("%s = %d, want 404", u, code)
+		}
+	}
+	// The MP4 has no subtitles.
+	var mp4 playbackInfo
+	getJSON(t, h, "/api/playback/"+itoa(mp4ID), &mp4)
+	if mp4.Subtitles == nil || len(mp4.Subtitles) != 0 {
+		t.Errorf("mp4 subtitles = %#v", mp4.Subtitles)
+	}
+
 	var other playbackInfo
 	getJSON(t, h, "/api/playback/"+itoa(mkvID), &other)
 	if other.URL == pb.URL {

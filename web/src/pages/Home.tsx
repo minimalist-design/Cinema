@@ -61,11 +61,14 @@ function ScanControl({ onFinished }: { onFinished: () => void }) {
       </button>
       {status?.running ? (
         <span>
-          {status.phase}: {status.filesSeen} files seen, {status.filesLinked} linked
+          {status.phase}
+          {status.phaseTotal > 0 ? ` (${status.phaseDone}/${status.phaseTotal})` : ""}: {status.filesSeen} files seen,{" "}
+          {status.filesLinked} linked
         </span>
       ) : status?.finishedAt ? (
         <span>
           Last scan: {status.filesLinked} linked, {status.filesIgnored} ignored, {status.filesRemoved} removed, {status.filesIndexed} indexed
+          {status.subtitlesExtracted > 0 ? `, subtitles extracted from ${status.subtitlesExtracted} files` : ""}
           {status.errors.length > 0 ? `, ${status.errors.length} errors` : ""}
         </span>
       ) : null}

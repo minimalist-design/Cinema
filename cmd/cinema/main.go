@@ -17,6 +17,7 @@ import (
 	"cinema/internal/images"
 	"cinema/internal/scanner"
 	"cinema/internal/server"
+	"cinema/internal/subtitles"
 	"cinema/internal/tmdb"
 	"cinema/internal/transcode"
 	"cinema/web"
@@ -39,22 +40,30 @@ func main() {
 
 	client := tmdb.New(cfg.TMDBToken, cfg.TMDBLanguage)
 	imgCache := images.New(cfg.CacheDir, database, client)
-	// HLS transcoding for MKVs, when ffmpeg is available. The scanner builds
-	// each MKV's keyframe index so playback can start straight away.
-	var hls *transcode.HLS
+	// HLS transcoding for MKVs and subtitles, when ffmpeg is available. The
+	// scanner indexes each file (subtitle tracks, and keyframes for MKVs) and
+	// extracts built-in subtitles, so playback can start straight away.
+	var media server.Media
 	var indexer scanner.Indexer
+	var extractor scanner.SubtitleExtractor
 	if tc, err := transcode.New(cfg.FFmpegPath, cfg.FFprobePath); err != nil {
-		log.Printf("transcoding disabled, MKV files will be served as-is: %v", err)
+		log.Printf("transcoding and subtitles disabled, files will be served as-is: %v", err)
 	} else {
-		store := transcode.NewStore(database, tc)
-		indexer = store
-		if hls, err = transcode.NewHLS(store, tc, filepath.Join(cfg.CacheDir, "hls")); err != nil {
+		media.Store = transcode.NewStore(database, tc)
+		indexer = media.Store
+		if media.HLS, err = transcode.NewHLS(media.Store, tc, filepath.Join(cfg.CacheDir, "hls")); err != nil {
 			log.Fatalf("hls: %v", err)
 		}
-		defer hls.Close()
+		defer media.HLS.Close()
+		media.Subtitles, err = subtitles.New(tc.FFmpeg(), filepath.Join(cfg.CacheDir, "subtitles"), cfg.SubtitleLanguages, media.Store)
+		if err != nil {
+			log.Fatalf("SUBTITLE_LANGUAGES: %v", err)
+		}
+		extractor = media.Subtitles
+		defer media.Subtitles.Close()
 	}
-	sc := scanner.New(ctx, database, client, imgCache, indexer, cfg.MoviesDir, cfg.TVDir)
-	srv := server.New(database, sc, imgCache, web.Dist(), hls)
+	sc := scanner.New(ctx, database, client, imgCache, indexer, extractor, cfg.MoviesDir, cfg.TVDir)
+	srv := server.New(database, sc, imgCache, web.Dist(), media)
 
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,

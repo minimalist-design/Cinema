@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import type Hls from "hls.js";
 
 // HlsVideo plays an HLS playlist with the browser's native controls. Safari
 // (and other browsers with built-in HLS) play it directly; elsewhere hls.js
 // feeds it to the video element through Media Source Extensions. hls.js is
-// loaded on demand so it's only downloaded when needed.
-export function HlsVideo({ src }: { src: string }) {
+// loaded on demand so it's only downloaded when needed. children go inside
+// the video element (e.g. <track>s).
+export function HlsVideo({ src, children }: { src: string; children?: ReactNode }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -58,7 +60,9 @@ export function HlsVideo({ src }: { src: string }) {
 
   return (
     <>
-      <video ref={videoRef} className="player-video" controls autoPlay />
+      <video ref={videoRef} className="player-video" controls autoPlay>
+        {children}
+      </video>
       {error ? <p role="alert">{error}</p> : null}
     </>
   );

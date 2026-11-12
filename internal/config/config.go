@@ -22,6 +22,8 @@ type Config struct {
 	CacheDir     string
 	FFmpegPath   string
 	FFprobePath  string
+	// SubtitleLanguages are the preferred subtitle languages, in order.
+	SubtitleLanguages []string
 }
 
 // Load reads .env (if present) and returns the config. Real environment
@@ -40,6 +42,11 @@ func Load() (*Config, error) {
 		CacheDir:     getenv("CACHE_DIR", "./data/cache"),
 		FFmpegPath:   getenv("FFMPEG_PATH", "ffmpeg"),
 		FFprobePath:  getenv("FFPROBE_PATH", "ffprobe"),
+	}
+	for _, l := range strings.Split(os.Getenv("SUBTITLE_LANGUAGES"), ",") {
+		if l = strings.TrimSpace(l); l != "" {
+			c.SubtitleLanguages = append(c.SubtitleLanguages, l)
+		}
 	}
 	for _, p := range []*string{&c.MoviesDir, &c.TVDir, &c.DBPath, &c.CacheDir, &c.FFmpegPath, &c.FFprobePath} {
 		expanded, err := expandHome(*p)

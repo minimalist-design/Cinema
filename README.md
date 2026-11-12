@@ -17,6 +17,7 @@ Add these to `.env` in the project root:
 | `TMDB_LANGUAGE` | | `en-US` |
 | `FFMPEG_PATH` | | `ffmpeg` (looked up on `PATH`) |
 | `FFPROBE_PATH` | | `ffprobe` (looked up on `PATH`) |
+| `SUBTITLE_LANGUAGES` | | Preferred subtitle languages in order, e.g. `eng` or `en,fr` (empty: use the file's default track) |
 
 Paths can be absolute, start with `~/` (your home directory), or be relative to the directory you start the server from. The `.env` file is also read from that directory.
 
@@ -57,7 +58,7 @@ For each title, every TMDB `append_to_response` extra is fetched. For shows, tha
 
 ## Playback
 
-The player asks `GET /api/playback/{fileId}` how to play a file.
+The player asks `GET /api/playback/{fileId}` how to play a file and which subtitles it has.
 
 - **Direct** (everything except MKV): the file is served untouched from `/api/stream/{fileId}` and played with the browser's native `<video>` controls, so the codecs must be supported by the browser. MP4/H.264 and WebM play everywhere; HEVC depends on the browser.
 - **HLS** (MKV, when ffmpeg and ffprobe are installed): the file is streamed as HLS from `/api/hls/{fileId}/{session}/index.m3u8`. Safari plays HLS natively; other browsers use [hls.js](https://github.com/video-dev/hls.js), which is only downloaded when an MKV is played. Native controls and seeking work everywhere.
@@ -68,6 +69,15 @@ The player asks `GET /api/playback/{fileId}` how to play a file.
 - The playlist lists every segment (about 6 seconds each) up front, so the player knows the duration. Copied video can only be cut on its own keyframes, so each MKV gets a **keyframe index** at the end of every library scan (stored in the `media_index` table). The index is built by seeking to every 6s mark through the MKV's cue index, so it reads very little of the file. A file that isn't indexed yet is indexed when it's first played.
 - Each playback is a session with its own ffmpeg process, which writes segments under `CACHE_DIR/hls`. Seeking far ahead or back restarts ffmpeg at that segment. ffmpeg is paused once it's 4 segments ahead of the player, segments the player is done with are deleted, and sessions idle for 90 seconds are stopped. At most 8 sessions run at once.
 
-If ffmpeg isn't found, a warning is logged at startup and MKVs are served as-is.
+### Subtitles
+
+Text subtitles appear in the browser's captions menu, for every file type:
+
+- **Built-in tracks** in SRT, ASS/SSA, WebVTT or MP4 text format. They're listed from the index built during the scan. At the end of each scan, the text tracks of every file that has some are extracted to WebVTT and cached under `CACHE_DIR/subtitles`, so they're ready at playback. Extracting means reading the whole file once, so the first scan of a large library spends a long time in this phase (the scan status shows its progress). The library can be browsed and played meanwhile. Later scans only extract new or changed files, and drop the cache of files no longer in the library. A file played before its turn comes is extracted then.
+- **Side files** next to the video (`.srt`, `.vtt`, `.ass`, `.ssa`), named Plex style after the video: `Movie (2020).srt`, `Movie (2020).en.srt`, `Movie (2020).eng.forced.srt`, `Movie (2020).en.sdh.srt`, `Movie (2020).en.default.srt`. They're found when a video is played, so newly added ones need no rescan. Files that aren't UTF-8 are read as Windows-1252.
+- **Not supported:** image subtitles (PGS from Blu-rays, VobSub from DVDs) can't be converted to text, so they're left out.
+- **Which track is shown at start:** with `SUBTITLE_LANGUAGES` set, the first preferred language that has a track. Within a language, a full track is preferred over an SDH one, and a forced track is used only if it's all there is. Side files come before built-in tracks, so a downloaded subtitle wins over the built-in one. With no preferred language available, nothing is shown. Without the setting, the track flagged default in the file is shown.
+
+If ffmpeg isn't found, a warning is logged at startup and MKVs are served as-is, without subtitles.
 
 Known limits: HDR video is converted to H.264 without tone mapping, so colours look washed out. Throttling relies on pausing ffmpeg with `SIGSTOP`, so on Windows ffmpeg runs ahead to the end of the file.

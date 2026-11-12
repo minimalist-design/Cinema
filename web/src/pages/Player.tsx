@@ -1,16 +1,29 @@
 import type { ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, episodeCode } from "../api";
+import type { SubtitleTrack } from "../api";
 import { HlsVideo } from "../components/HlsVideo";
 import { useFetch } from "../useFetch";
+
+// Subtitles show up in the browser's own captions menu.
+function SubtitleTracks({ tracks }: { tracks: SubtitleTrack[] }) {
+  return tracks.map((t) => (
+    <track key={t.id} kind="subtitles" src={t.url} label={t.label} srcLang={t.language || undefined} default={t.default} />
+  ));
+}
 
 function Video({ fileId }: { fileId: number }) {
   const { data: playback, error, loading } = useFetch(() => api.playback(fileId), [fileId]);
 
   if (error) return <p role="alert">{error}</p>;
   if (loading || !playback) return <p>Loading…</p>;
-  if (playback.mode === "hls") return <HlsVideo src={playback.url} />;
-  return <video className="player-video" src={playback.url} controls autoPlay preload="metadata" />;
+  const tracks = <SubtitleTracks tracks={playback.subtitles} />;
+  if (playback.mode === "hls") return <HlsVideo src={playback.url}>{tracks}</HlsVideo>;
+  return (
+    <video className="player-video" src={playback.url} controls autoPlay preload="metadata">
+      {tracks}
+    </video>
+  );
 }
 
 function PlayerLayout({ fileId, children }: { fileId: number; children: ReactNode }) {
