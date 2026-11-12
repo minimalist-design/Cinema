@@ -18,6 +18,8 @@ Add these to `.env` in the project root:
 | `FFMPEG_PATH` | | `ffmpeg` (looked up on `PATH`) |
 | `FFPROBE_PATH` | | `ffprobe` (looked up on `PATH`) |
 
+Paths can be absolute, start with `~/` (your home directory), or be relative to the directory you start the server from. The `.env` file is also read from that directory.
+
 ```sh
 make build     # npm install + vite build, then go build (frontend embedded)
 ./cinema       # open http://localhost:8080 and click "Rescan library"
