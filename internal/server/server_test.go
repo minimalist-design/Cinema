@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"cinema/internal/scanner"
 	"cinema/internal/server"
 	"cinema/internal/tmdb"
+	"cinema/internal/transcode"
 )
 
 const movieJSON = `{
@@ -278,7 +280,7 @@ func TestEndToEnd(t *testing.T) {
 	}
 
 	// ---- API
-	h := server.New(database, sc, img, fstest.MapFS{"index.html": {Data: []byte("<html>app</html>")}}).Handler()
+	h := server.New(database, sc, img, fstest.MapFS{"index.html": {Data: []byte("<html>app</html>")}}, nil).Handler()
 
 	var lib struct {
 		Movies []struct {
@@ -387,6 +389,68 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if got := count(t, database, `SELECT COUNT(*) FROM credits WHERE owner_type = 'movie'`); got != 2 {
 		t.Errorf("credits after refresh = %d", got)
+	}
+
+	testPlayback(t, database, sc, img, movie.FileID,
+		filepath.Join(tvDir, "Test Show (2020)", "Season 01", "Test Show (2020) - s01e01 - Pilot.mkv"))
+}
+
+type playbackInfo struct {
+	Mode     string   `json:"mode"`
+	URL      string   `json:"url"`
+	Start    float64  `json:"start"`
+	Duration *float64 `json:"duration"`
+}
+
+// testPlayback checks that MP4s play directly and MKVs go through the
+// transcoder when ffmpeg is available.
+func testPlayback(t *testing.T, database *sql.DB, sc *scanner.Scanner, img *images.Cache, mp4ID int, mkvPath string) {
+	var mkvID int
+	if err := database.QueryRow(`SELECT id FROM files WHERE path = ?`, mkvPath).Scan(&mkvID); err != nil {
+		t.Fatal(err)
+	}
+	web := fstest.MapFS{}
+
+	// Without ffmpeg everything is served as-is.
+	h := server.New(database, sc, img, web, nil).Handler()
+	var pb playbackInfo
+	getJSON(t, h, "/api/playback/"+itoa(mkvID), &pb)
+	if pb.Mode != "direct" || pb.URL != "/api/stream/"+itoa(mkvID) {
+		t.Errorf("mkv playback without ffmpeg = %+v", pb)
+	}
+	if code := getJSON(t, h, "/api/transcode/"+itoa(mkvID), nil); code != http.StatusNotImplemented {
+		t.Errorf("transcode without ffmpeg = %d", code)
+	}
+
+	tc, err := transcode.New("ffmpeg", "ffprobe")
+	if err != nil {
+		t.Skip("ffmpeg not installed:", err)
+	}
+	h = server.New(database, sc, img, web, tc).Handler()
+	getJSON(t, h, "/api/playback/"+itoa(mp4ID), &pb)
+	if pb.Mode != "direct" {
+		t.Errorf("mp4 playback = %+v", pb)
+	}
+
+	// Replace the placeholder episode with a real 4s MKV (H.264 + AC3).
+	cmd := exec.Command("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24",
+		"-f", "lavfi", "-i", "sine", "-t", "4", "-c:v", "libx264", "-c:a", "ac3", "-f", "matroska", mkvPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("can't generate test media: %v: %s", err, out)
+	}
+	pb = playbackInfo{}
+	getJSON(t, h, "/api/playback/"+itoa(mkvID)+"?start=0", &pb)
+	if pb.Mode != "transcode" || pb.Duration == nil || *pb.Duration < 3.9 || pb.URL != "/api/transcode/"+itoa(mkvID)+"?start=0.000" {
+		t.Fatalf("mkv playback = %+v", pb)
+	}
+	if code := getJSON(t, h, "/api/playback/"+itoa(mkvID)+"?start=-1", nil); code != http.StatusBadRequest {
+		t.Errorf("negative start = %d", code)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", pb.URL, nil))
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "video/mp4" || !strings.Contains(rec.Body.String()[:64], "ftyp") {
+		t.Errorf("transcode: %d %q, %d bytes", rec.Code, rec.Header().Get("Content-Type"), rec.Body.Len())
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"cinema/internal/scanner"
 	"cinema/internal/server"
 	"cinema/internal/tmdb"
+	"cinema/internal/transcode"
 	"cinema/web"
 )
 
@@ -38,7 +39,12 @@ func main() {
 	client := tmdb.New(cfg.TMDBToken, cfg.TMDBLanguage)
 	imgCache := images.New(cfg.CacheDir, database, client)
 	sc := scanner.New(ctx, database, client, imgCache, cfg.MoviesDir, cfg.TVDir)
-	srv := server.New(database, sc, imgCache, web.Dist())
+	tc, err := transcode.New(cfg.FFmpegPath, cfg.FFprobePath)
+	if err != nil {
+		log.Printf("transcoding disabled, MKV files will be served as-is: %v", err)
+		tc = nil
+	}
+	srv := server.New(database, sc, imgCache, web.Dist(), tc)
 
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,

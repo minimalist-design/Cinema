@@ -1,6 +1,6 @@
 # Cinema
 
-A small media server for movies and TV shows. Written in Go with SQLite, it pulls metadata from TMDB and has a React UI. Video files are served as-is (no transcoding) with HTTP range support, so seeking works.
+A small media server for movies and TV shows. Written in Go with SQLite, it pulls metadata from TMDB and has a React UI. Video files are served as-is with HTTP range support, except MKVs, which are transcoded on the fly with ffmpeg.
 
 ## Setup
 
@@ -15,6 +15,8 @@ Add these to `.env` in the project root:
 | `DB_PATH` | | `./data/cinema.db` |
 | `CACHE_DIR` | | `./data/cache` (downloaded images) |
 | `TMDB_LANGUAGE` | | `en-US` |
+| `FFMPEG_PATH` | | `ffmpeg` (looked up on `PATH`) |
+| `FFPROBE_PATH` | | `ffprobe` (looked up on `PATH`) |
 
 ```sh
 make build     # npm install + vite build, then go build (frontend embedded)
@@ -53,4 +55,15 @@ For each title, every TMDB `append_to_response` extra is fetched. For shows, tha
 
 ## Playback
 
-Playback uses the browser's native `<video>` element, so the container and codecs must be supported by the browser. MP4/H.264 and WebM play everywhere. MKV and HEVC depend on the browser.
+The player asks `GET /api/playback/{fileId}` how to play a file.
+
+- **Direct** (everything except MKV): the file is served untouched from `/api/stream/{fileId}` and played with the browser's native `<video>` controls, so the codecs must be supported by the browser. MP4/H.264 and WebM play everywhere; HEVC depends on the browser.
+- **Transcode** (MKV, when ffmpeg and ffprobe are installed): `/api/transcode/{fileId}?start=<seconds>` streams a fragmented MP4 made by ffmpeg.
+  - H.264 (8-bit) video and AAC/MP3 audio are copied without re-encoding, so the common H.264 + AC3/DTS MKV costs almost no CPU. Other video (HEVC, 10-bit H.264, MPEG-4, …) is encoded to H.264 at up to 1080p, and other audio to stereo AAC.
+  - The default audio track is used. Subtitles are dropped.
+  - The stream can't be seeked by byte ranges, so the player has its own controls and seeks by requesting a new stream from that time (`/api/playback/{fileId}?start=<seconds>` returns its URL). With copied video a stream has to begin on a keyframe, so it may start a few seconds before the requested time.
+  - Closing the player or seeking stops the ffmpeg process.
+
+If ffmpeg isn't found, a warning is logged at startup and MKVs are served as-is.
+
+Known limits: Safari won't play transcoded streams (it requires range requests). HDR video is converted to H.264 without tone mapping, so colours look washed out.

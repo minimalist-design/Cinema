@@ -18,6 +18,8 @@ type Config struct {
 	Port         string
 	DBPath       string
 	CacheDir     string
+	FFmpegPath   string
+	FFprobePath  string
 }
 
 // Load reads .env (if present) and returns the config. Real environment
@@ -34,6 +36,8 @@ func Load() (*Config, error) {
 		Port:         getenv("PORT", "8080"),
 		DBPath:       getenv("DB_PATH", "./data/cinema.db"),
 		CacheDir:     getenv("CACHE_DIR", "./data/cache"),
+		FFmpegPath:   getenv("FFMPEG_PATH", "ffmpeg"),
+		FFprobePath:  getenv("FFPROBE_PATH", "ffprobe"),
 	}
 	var missing []string
 	if c.TMDBToken == "" {

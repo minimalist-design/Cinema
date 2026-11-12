@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -18,6 +20,7 @@ import (
 
 	"cinema/internal/images"
 	"cinema/internal/scanner"
+	"cinema/internal/transcode"
 )
 
 type Server struct {
@@ -25,10 +28,13 @@ type Server struct {
 	scanner *scanner.Scanner
 	images  *images.Cache
 	web     fs.FS
+	// transcoder is nil when ffmpeg isn't available; files are then always
+	// served as-is.
+	transcoder *transcode.Transcoder
 }
 
-func New(db *sql.DB, sc *scanner.Scanner, img *images.Cache, web fs.FS) *Server {
-	return &Server{db: db, scanner: sc, images: img, web: web}
+func New(db *sql.DB, sc *scanner.Scanner, img *images.Cache, web fs.FS, tc *transcode.Transcoder) *Server {
+	return &Server{db: db, scanner: sc, images: img, web: web, transcoder: tc}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -38,6 +44,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/shows/{id}", s.show)
 	mux.HandleFunc("GET /api/episodes/{id}", s.episode)
 	mux.HandleFunc("GET /api/stream/{id}", s.stream)
+	mux.HandleFunc("GET /api/playback/{id}", s.playback)
+	mux.HandleFunc("GET /api/transcode/{id}", s.transcode)
 	mux.HandleFunc("GET /api/scan", s.scanStatus)
 	mux.HandleFunc("POST /api/scan", s.startScan)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
@@ -294,13 +302,8 @@ var contentTypes = map[string]string{
 // stream serves the original file untouched. http.ServeContent handles Range
 // requests (206 Partial Content), so the browser can seek.
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
+	p, ok := s.filePath(w, r)
 	if !ok {
-		return
-	}
-	var p string
-	err := s.db.QueryRowContext(r.Context(), `SELECT path FROM files WHERE id = ?`, id).Scan(&p)
-	if notFound(w, err) {
 		return
 	}
 	f, err := os.Open(p)
@@ -318,6 +321,129 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", ct)
 	}
 	http.ServeContent(w, r, filepath.Base(p), info.ModTime(), f)
+}
+
+// transcodeExts are containers browsers can't play natively; with ffmpeg
+// available they're streamed through the transcoder instead.
+var transcodeExts = map[string]bool{".mkv": true}
+
+func (s *Server) needsTranscode(p string) bool {
+	return s.transcoder != nil && transcodeExts[strings.ToLower(filepath.Ext(p))]
+}
+
+// filePath looks up a file's path, writing an error response if it fails.
+func (s *Server) filePath(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return "", false
+	}
+	var p string
+	err := s.db.QueryRowContext(r.Context(), `SELECT path FROM files WHERE id = ?`, id).Scan(&p)
+	if notFound(w, err) {
+		return "", false
+	}
+	return p, true
+}
+
+// playback tells the player how to play a file. For transcoded files the
+// stream can't be seeked by byte ranges, so the player asks again with
+// ?start=<seconds> to seek; the response's start is where that stream really
+// begins (an earlier keyframe when video is copied), which the player adds to
+// the video element's currentTime.
+func (s *Server) playback(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.filePath(w, r)
+	if !ok {
+		return
+	}
+	id := r.PathValue("id")
+	if !s.needsTranscode(p) {
+		writeJSON(w, map[string]any{"mode": "direct", "url": "/api/stream/" + id, "start": 0, "duration": nil})
+		return
+	}
+	start, ok := startParam(w, r)
+	if !ok {
+		return
+	}
+	info, err := s.transcoder.Probe(r.Context(), p)
+	if errors.Is(err, fs.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "file missing on disk; rescan the library")
+		return
+	} else if err != nil {
+		serverError(w, err)
+		return
+	}
+	start = s.transcoder.StartFor(r.Context(), p, info, start)
+	startStr := strconv.FormatFloat(start, 'f', 3, 64)
+	writeJSON(w, map[string]any{
+		"mode":     "transcode",
+		"url":      "/api/transcode/" + id + "?start=" + startStr,
+		"start":    start,
+		"duration": info.Duration,
+	})
+}
+
+// transcode streams a file as fragmented MP4 from ?start=<seconds>. ffmpeg is
+// killed when the client disconnects (e.g. when the player seeks).
+func (s *Server) transcode(w http.ResponseWriter, r *http.Request) {
+	if s.transcoder == nil {
+		writeError(w, http.StatusNotImplemented, "transcoding unavailable: ffmpeg not found")
+		return
+	}
+	p, ok := s.filePath(w, r)
+	if !ok {
+		return
+	}
+	start, ok := startParam(w, r)
+	if !ok {
+		return
+	}
+	info, err := s.transcoder.Probe(r.Context(), p)
+	if errors.Is(err, fs.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "file missing on disk; rescan the library")
+		return
+	} else if err != nil {
+		serverError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Accept-Ranges", "none")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	fw := &flushWriter{w: w, rc: http.NewResponseController(w)}
+	if err := s.transcoder.Transcode(r.Context(), fw, p, info, start); err != nil {
+		log.Printf("transcode: %v", err)
+	}
+}
+
+func startParam(w http.ResponseWriter, r *http.Request) (float64, bool) {
+	v := r.URL.Query().Get("start")
+	if v == "" {
+		return 0, true
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) {
+		writeError(w, http.StatusBadRequest, "invalid start")
+		return 0, false
+	}
+	return f, true
+}
+
+// flushWriter flushes after every write so video data reaches the browser
+// as soon as ffmpeg produces it.
+type flushWriter struct {
+	w  io.Writer
+	rc *http.ResponseController
+}
+
+func (f *flushWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if err == nil {
+		err = f.rc.Flush()
+	}
+	return n, err
 }
 
 // ---------------------------------------------------------------- scanning
@@ -412,6 +538,9 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
 }
+
+// Unwrap lets http.ResponseController reach the underlying writer's Flush.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

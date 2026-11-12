@@ -1,13 +1,23 @@
 import type { ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api, episodeCode, streamUrl } from "../api";
+import { api, episodeCode } from "../api";
+import { TranscodedVideo } from "../components/TranscodedVideo";
 import { useFetch } from "../useFetch";
+
+function Video({ fileId }: { fileId: number }) {
+  const { data: playback, error, loading } = useFetch(() => api.playback(fileId), [fileId]);
+
+  if (error) return <p role="alert">{error}</p>;
+  if (loading || !playback) return <p>Loading…</p>;
+  if (playback.mode === "transcode") return <TranscodedVideo fileId={fileId} initial={playback} />;
+  return <video className="player-video" src={playback.url} controls autoPlay preload="metadata" />;
+}
 
 function PlayerLayout({ fileId, children }: { fileId: number; children: ReactNode }) {
   return (
     <div className="player-page">
-      {/* key forces a fresh <video> element when the file changes */}
-      <video key={fileId} className="player-video" src={streamUrl(fileId)} controls autoPlay preload="metadata" />
+      {/* key gives each file a fresh player (and fresh playback info) */}
+      <Video key={fileId} fileId={fileId} />
       <div className="player-info">{children}</div>
     </div>
   );

@@ -72,6 +72,17 @@ export interface ScanStatus {
   errors: string[];
 }
 
+// How to play a file. "direct" files are served as-is with range support and
+// use the browser's native controls. "transcode" streams can't be seeked by
+// the browser: seek by asking for a new Playback with a start time, then add
+// `start` to the video element's currentTime.
+export interface Playback {
+  mode: "direct" | "transcode";
+  url: string;
+  start: number;
+  duration: number | null;
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   const body = await res.json().catch(() => null);
@@ -88,9 +99,8 @@ export const api = {
   episode: (id: string) => request<Episode>(`/api/episodes/${id}`),
   scanStatus: () => request<ScanStatus>("/api/scan"),
   startScan: () => request<ScanStatus>("/api/scan", { method: "POST" }),
+  playback: (fileId: number, start = 0) => request<Playback>(`/api/playback/${fileId}?start=${start.toFixed(3)}`),
 };
-
-export const streamUrl = (fileId: number) => `/api/stream/${fileId}`;
 
 export const episodeCode = (season: number, episode: number) =>
   `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
