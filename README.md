@@ -78,6 +78,12 @@ The player asks `GET /api/playback/{fileId}` how to play a file and which subtit
 - The playlist lists every segment (about 6 seconds each) up front, so the player knows the duration. Copied video can only be cut on its own keyframes, so each MKV gets a **keyframe index** at the end of every library scan (stored in the `media_index` table). The index is built by seeking to every 6s mark through the MKV's cue index, so it reads very little of the file. A file that isn't indexed yet is indexed when it's first played.
 - Each playback is a session with its own ffmpeg process, which writes segments under `CACHE_DIR/hls`. Seeking far ahead or back restarts ffmpeg at that segment. ffmpeg is paused once it's 4 segments ahead of the player, segments the player is done with are deleted, and sessions idle for 90 seconds are stopped. At most 8 sessions run at once.
 
+### Watch progress
+
+The player saves how far each movie and episode was watched (every 10 seconds while playing, on pause, and when leaving). Reopening an unfinished title resumes where it was left, with a *Start over* button. A title counts as watched once it plays to the end or into its last 2 minutes or 5%.
+
+The home page uses this for **Continue watching**: the most recently watched show's unfinished episode, or the next episode in the library not watched yet (moving on to the next most recent show once one is done). Next to it, **Movies to watch** lists movies not watched yet, the ones already started first, then a selection that changes daily.
+
 ### Subtitles
 
 Text subtitles appear in the browser's captions menu, for every file type:

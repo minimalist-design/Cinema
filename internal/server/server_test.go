@@ -741,3 +741,118 @@ func waitForScan(t *testing.T, sc *scanner.Scanner) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+func TestWatchProgress(t *testing.T) {
+	tmp := t.TempDir()
+	moviesDir, tvDir := filepath.Join(tmp, "movies"), filepath.Join(tmp, "tv")
+	writeFile(t, filepath.Join(moviesDir, "Big Buck Bunny (2008).mp4"), "bunny")
+	writeFile(t, filepath.Join(tvDir, "Test Show (2020)", "Season 01", "Test Show (2020) - s01e01.mp4"), "ep1")
+	writeFile(t, filepath.Join(tvDir, "Test Show (2020)", "Season 01", "Test Show (2020) - s01e02.mp4"), "ep2")
+
+	fake := newFakeTMDB(t)
+	database, err := db.Open(filepath.Join(tmp, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	client := tmdb.New("test-token", "en-US")
+	client.BaseURL, client.ImageBaseURL = fake.URL, fake.URL+"/img"
+	img := images.New(filepath.Join(tmp, "cache"), database, client)
+	sc := scanner.New(context.Background(), database, client, img, nil, nil,
+		scanner.StaticFolders{Movies: []string{moviesDir}, TV: []string{tvDir}})
+	if st := sc.Run(context.Background(), false); len(st.Errors) > 0 || st.FilesLinked != 3 {
+		t.Fatalf("scan = %+v", st)
+	}
+	h := server.New(database, sc, img, fstest.MapFS{}, server.Media{}).Handler()
+
+	type home struct {
+		Continue *struct {
+			Reason   string   `json:"reason"`
+			Position *float64 `json:"position"`
+			Episode  struct {
+				ID       int     `json:"id"`
+				StillURL *string `json:"stillUrl"`
+			} `json:"episode"`
+			Show struct {
+				ID   int    `json:"id"`
+				Name string `json:"name"`
+			} `json:"show"`
+		} `json:"continue"`
+		Suggestions []struct {
+			ID       int      `json:"id"`
+			Progress *float64 `json:"progress"`
+		} `json:"suggestions"`
+	}
+	getHome := func() home {
+		t.Helper()
+		var hm home
+		if code := getJSON(t, h, "/api/home", &hm); code != 200 {
+			t.Fatalf("GET /api/home = %d", code)
+		}
+		return hm
+	}
+	progress := func(body string, want int) {
+		t.Helper()
+		if code := doJSON(t, h, "POST", "/api/progress", body, nil); code != want {
+			t.Errorf("POST progress %s = %d, want %d", body, code, want)
+		}
+	}
+	resumeAt := func(url string) *float64 {
+		t.Helper()
+		var v struct {
+			ResumeAt *float64 `json:"resumeAt"`
+		}
+		getJSON(t, h, url, &v)
+		return v.ResumeAt
+	}
+
+	// Nothing watched: nothing to continue, the movie is suggested.
+	hm := getHome()
+	if hm.Continue != nil || len(hm.Suggestions) != 1 || hm.Suggestions[0].ID != 10378 || hm.Suggestions[0].Progress != nil {
+		t.Errorf("home before watching = %+v", hm)
+	}
+
+	progress(`{"kind": "episode", "id": 1001, "position": 600, "duration": 1800}`, 204)
+	progress(`{"kind": "show", "id": 100, "position": 1, "duration": 2}`, 400)
+	progress(`{"kind": "episode", "id": 1001, "position": 1, "duration": 0}`, 400)
+	progress(`{"kind": "episode", "id": 999, "position": 600, "duration": 1800}`, 404)
+
+	// Half watched: resume it, where it was left.
+	hm = getHome()
+	if c := hm.Continue; c == nil || c.Reason != "resume" || c.Episode.ID != 1001 || *c.Position != 600 || c.Show.Name != "Test Show" ||
+		c.Episode.StillURL == nil || *c.Episode.StillURL != "/images/w780/still1.jpg" {
+		t.Errorf("continue after starting = %+v", hm.Continue)
+	}
+	if p := resumeAt("/api/episodes/1001"); p == nil || *p != 600 {
+		t.Errorf("episode resumeAt = %v", p)
+	}
+
+	// Finished (into the credits): the next episode.
+	progress(`{"kind": "episode", "id": 1001, "position": 1750, "duration": 1800}`, 204)
+	hm = getHome()
+	if c := hm.Continue; c == nil || c.Reason != "next" || c.Episode.ID != 1002 || c.Position != nil {
+		t.Errorf("continue after finishing = %+v", hm.Continue)
+	}
+	if p := resumeAt("/api/episodes/1001"); p != nil {
+		t.Errorf("finished episode resumeAt = %v", *p)
+	}
+
+	// Last episode played to the end: nothing left in the show.
+	progress(`{"kind": "episode", "id": 1002, "position": 3, "duration": 1800, "ended": true}`, 204)
+	if hm = getHome(); hm.Continue != nil {
+		t.Errorf("continue after the last episode = %+v", hm.Continue)
+	}
+
+	// A started movie shows its progress; a finished one isn't suggested.
+	progress(`{"kind": "movie", "id": 10378, "position": 300, "duration": 6000}`, 204)
+	if hm = getHome(); len(hm.Suggestions) != 1 || hm.Suggestions[0].Progress == nil || *hm.Suggestions[0].Progress != 0.05 {
+		t.Errorf("suggestions with a started movie = %+v", hm.Suggestions)
+	}
+	if p := resumeAt("/api/movies/10378"); p == nil || *p != 300 {
+		t.Errorf("movie resumeAt = %v", p)
+	}
+	progress(`{"kind": "movie", "id": 10378, "position": 5900, "duration": 6000}`, 204)
+	if hm = getHome(); len(hm.Suggestions) != 0 {
+		t.Errorf("suggestions after watching = %+v", hm.Suggestions)
+	}
+}

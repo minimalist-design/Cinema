@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { ReactNode, Ref } from "react";
 import type Hls from "hls.js";
 import { Box } from "@mantine/core";
+import { useMergedRef } from "@mantine/hooks";
 import { ErrorAlert } from "./States";
 
 // HlsVideo plays an HLS playlist with the browser's native controls. Safari
@@ -9,18 +10,25 @@ import { ErrorAlert } from "./States";
 // feeds it to the video element through Media Source Extensions. hls.js is
 // loaded on demand so it's only downloaded when needed. children go inside
 // the video element (e.g. <track>s); frameClassName styles the box around it.
+// startAt (seconds) makes hls.js start loading there rather than at the
+// beginning; with native HLS, the caller seeks once metadata is loaded.
 export function HlsVideo({
   src,
   className,
   frameClassName,
+  startAt,
+  videoRef: outerRef,
   children,
 }: {
   src: string;
   className?: string;
   frameClassName?: string;
+  startAt?: number | null;
+  videoRef?: Ref<HTMLVideoElement>;
   children?: ReactNode;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const mergedRef = useMergedRef(videoRef, outerRef);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -45,7 +53,7 @@ export function HlsVideo({
           setError("This browser can't play this video.");
           return;
         }
-        const player = new HlsJs();
+        const player = new HlsJs(startAt ? { startPosition: startAt } : undefined);
         hls = player;
         let recovered = false;
         player.on(HlsJs.Events.ERROR, (_event, data) => {
@@ -68,12 +76,14 @@ export function HlsVideo({
       cancelled = true;
       hls?.destroy();
     };
+    // startAt only matters when the source loads.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [src]);
 
   return (
     <>
       <Box className={frameClassName}>
-        <video ref={videoRef} className={className} controls autoPlay>
+        <video ref={mergedRef} className={className} controls autoPlay>
           {children}
         </video>
       </Box>

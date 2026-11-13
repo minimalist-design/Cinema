@@ -19,6 +19,8 @@ export interface Movie {
   overview: string | null;
   posterUrl: string | null;
   fileId: number;
+  // Where to resume playback (seconds), or null to start from the beginning.
+  resumeAt: number | null;
 }
 
 export interface EpisodeItem {
@@ -55,7 +57,44 @@ export interface Episode {
   overview: string | null;
   fileId: number;
   nextEpisodeId: number | null;
+  resumeAt: number | null;
   show: { id: number; name: string };
+}
+
+// The episode to watch next, at the top of the home page: an unfinished one
+// to "resume", or the "next" one after the last watched.
+export interface ContinueEpisode {
+  reason: "resume" | "next";
+  position: number | null;
+  duration: number | null;
+  episode: {
+    id: number;
+    seasonNumber: number;
+    episodeNumber: number;
+    name: string | null;
+    overview: string | null;
+    airDate: string | null;
+    stillUrl: string | null;
+  };
+  show: { id: number; name: string; posterUrl: string | null; backdropUrl: string | null };
+}
+
+export interface MovieSuggestion extends LibraryItem {
+  // How much was watched (0 to 1), for movies already started.
+  progress: number | null;
+}
+
+export interface HomeData {
+  continue: ContinueEpisode | null;
+  suggestions: MovieSuggestion[];
+}
+
+export interface Progress {
+  kind: "movie" | "episode";
+  id: number;
+  position: number;
+  duration: number;
+  ended?: boolean;
 }
 
 export interface ScanStatus {
@@ -166,6 +205,12 @@ export const api = {
   scanStatus: () => request<ScanStatus>("/api/scan"),
   startScan: (refresh = false) => request<ScanStatus>(`/api/scan${refresh ? "?refresh=1" : ""}`, { method: "POST" }),
   playback: (fileId: number) => request<Playback>(`/api/playback/${fileId}`),
+  home: () => request<HomeData>("/api/home"),
+  // keepalive lets the request finish while the page is closing.
+  saveProgress: (p: Progress, keepalive = false) =>
+    fetch("/api/progress", { ...json("POST", p), keepalive }).then((res) => {
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    }),
   settings: () => request<Settings>("/api/settings"),
   updateSettings: (patch: SettingsPatch) => request<Settings>("/api/settings", json("PUT", patch)),
   folders: () => request<LibraryFolder[]>("/api/folders"),
@@ -186,4 +231,19 @@ export function formatDate(date: string) {
   const d = new Date(`${date}T00:00:00`);
   if (Number.isNaN(d.getTime())) return date;
   return d.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+}
+
+// formatDuration formats seconds as 1:02:03 or 2:03.
+export function formatDuration(seconds: number) {
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = String(s % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
+}
+
+// formatRemaining formats a time left, such as "23 min left" or "1 h 5 min left".
+export function formatRemaining(seconds: number) {
+  const min = Math.max(1, Math.round(seconds / 60));
+  return min >= 60 ? `${Math.floor(min / 60)} h ${min % 60} min left` : `${min} min left`;
 }

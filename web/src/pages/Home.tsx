@@ -5,6 +5,7 @@ import { useDocumentTitle } from "@mantine/hooks";
 import { api, type Library } from "../api";
 import { useFetch } from "../useFetch";
 import { useScan } from "../scan";
+import { ForYou } from "../components/ForYou";
 import { MediaRow } from "../components/MediaRow";
 import { PosterGrid, type MediaItem } from "../components/PosterCard";
 import { SearchBox } from "../components/SearchBox";
@@ -113,6 +114,7 @@ export default function Home() {
   const q = (params.get("q") ?? "").trim().toLowerCase();
   const { finished } = useScan();
   const { data, error, loading } = useFetch(api.library, [finished]);
+  const { data: home } = useFetch(api.home, [finished]);
 
   const items = useMemo(() => (data ? toItems(data) : null), [data]);
   const recent = useMemo(() => {
@@ -132,6 +134,7 @@ export default function Home() {
       {items && !q && items.movies.length + items.shows.length === 0 ? <GettingStarted /> : null}
       {items && !q ? (
         <>
+          {home ? <ForYou data={home} hasShows={items.shows.length > 0} /> : null}
           <MediaRow title="Recently added" items={recent} withKind />
           <MediaRow title="Movies" items={items.movies.slice(0, ROW_LIMIT)} seeAll="/movies" />
           <MediaRow title="TV Shows" items={items.shows.slice(0, ROW_LIMIT)} seeAll="/shows" />

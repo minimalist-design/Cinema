@@ -60,6 +60,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/subtitles/{id}/{track}", s.subtitle)
 	mux.HandleFunc("GET /api/scan", s.scanStatus)
 	mux.HandleFunc("POST /api/scan", s.startScan)
+	mux.HandleFunc("GET /api/home", s.home)
+	mux.HandleFunc("POST /api/progress", s.saveProgress)
 	s.adminRoutes(mux)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
@@ -160,6 +162,8 @@ func (s *Server) movie(w http.ResponseWriter, r *http.Request) {
 		Overview    *string `json:"overview"`
 		PosterURL   *string `json:"posterUrl"`
 		FileID      int64   `json:"fileId"`
+		// Where to resume playback (seconds), or null to start over.
+		ResumeAt *float64 `json:"resumeAt"`
 	}
 	var date, overview, poster sql.NullString
 	var fileID sql.NullInt64
@@ -175,6 +179,10 @@ func (s *Server) movie(w http.ResponseWriter, r *http.Request) {
 	}
 	out.FileID = fileID.Int64
 	out.ReleaseDate, out.Overview, out.PosterURL = nullStr(date), nullStr(overview), imageURL(posterSize, poster)
+	if out.ResumeAt, err = s.resumeAt(r.Context(), "movie", id); err != nil {
+		serverError(w, err)
+		return
+	}
 	writeJSON(w, out)
 }
 
@@ -268,7 +276,9 @@ func (s *Server) episode(w http.ResponseWriter, r *http.Request) {
 		Overview      *string `json:"overview"`
 		FileID        int64   `json:"fileId"`
 		NextEpisodeID *int    `json:"nextEpisodeId"`
-		Show          struct {
+		// Where to resume playback (seconds), or null to start over.
+		ResumeAt *float64 `json:"resumeAt"`
+		Show     struct {
 			ID   int    `json:"id"`
 			Name string `json:"name"`
 		} `json:"show"`
@@ -303,6 +313,10 @@ func (s *Server) episode(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		out.NextEpisodeID = &next
 	} else if !errors.Is(err, sql.ErrNoRows) {
+		serverError(w, err)
+		return
+	}
+	if out.ResumeAt, err = s.resumeAt(r.Context(), "episode", id); err != nil {
 		serverError(w, err)
 		return
 	}
