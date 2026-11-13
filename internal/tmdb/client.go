@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -27,10 +28,12 @@ var ErrNotFound = errors.New("tmdb: not found")
 type Client struct {
 	BaseURL      string
 	ImageBaseURL string
-	token        string
-	language     string
 	http         *http.Client
 	limiter      *rate.Limiter
+
+	mu       sync.RWMutex // guards token and language, changed from settings
+	token    string
+	language string
 }
 
 func New(token, language string) *Client {
@@ -45,14 +48,75 @@ func New(token, language string) *Client {
 	}
 }
 
+// ErrUnauthorized is returned when TMDB rejects the token.
+var ErrUnauthorized = errors.New("tmdb: invalid token")
+
+// SetToken replaces the API token used by later requests.
+func (c *Client) SetToken(token string) {
+	c.mu.Lock()
+	c.token = token
+	c.mu.Unlock()
+}
+
+// SetLanguage replaces the metadata language used by later requests.
+func (c *Client) SetLanguage(language string) {
+	c.mu.Lock()
+	c.language = language
+	c.mu.Unlock()
+}
+
+// HasToken reports whether a token is set.
+func (c *Client) HasToken() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.token != ""
+}
+
+func (c *Client) auth() (token, language string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.token, c.language
+}
+
+// VerifyToken checks a token (not necessarily the client's) with a single
+// request, without retries. It returns ErrUnauthorized if TMDB rejects it.
+func (c *Client) VerifyToken(ctx context.Context, token string) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/configuration", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("couldn't reach TMDB: %w", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		return nil
+	case resp.StatusCode == http.StatusUnauthorized:
+		return ErrUnauthorized
+	default:
+		return fmt.Errorf("TMDB answered with status %d", resp.StatusCode)
+	}
+}
+
 // Get performs a GET against the API and returns the raw body. It retries on
 // 429 and 5xx responses and network errors.
 func (c *Client) Get(ctx context.Context, path string, q url.Values) ([]byte, error) {
+	token, language := c.auth()
+	if token == "" {
+		return nil, fmt.Errorf("%w: no TMDB token set", ErrUnauthorized)
+	}
 	if q == nil {
 		q = url.Values{}
 	}
-	if c.language != "" && q.Get("language") == "" {
-		q.Set("language", c.language)
+	if language != "" && q.Get("language") == "" {
+		q.Set("language", language)
 	}
 	u := c.BaseURL + path + "?" + q.Encode()
 
@@ -65,7 +129,7 @@ func (c *Client) Get(ctx context.Context, path string, q url.Values) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Accept", "application/json")
 
 		resp, err := c.http.Do(req)
@@ -86,6 +150,8 @@ func (c *Client) Get(ctx context.Context, path string, q url.Values) ([]byte, er
 			return body, nil
 		case resp.StatusCode == http.StatusNotFound:
 			return nil, fmt.Errorf("%w: %s", ErrNotFound, path)
+		case resp.StatusCode == http.StatusUnauthorized:
+			return nil, fmt.Errorf("%w: %s", ErrUnauthorized, path)
 		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 			lastErr = fmt.Errorf("tmdb %s: status %d", path, resp.StatusCode)
 			sleep(ctx, backoff(attempt, resp.Header.Get("Retry-After")))
@@ -116,7 +182,7 @@ const (
 )
 
 func (c *Client) imageLangs() string {
-	lang := c.language
+	_, lang := c.auth()
 	if i := strings.IndexByte(lang, '-'); i > 0 {
 		lang = lang[:i]
 	}

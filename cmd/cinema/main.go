@@ -17,6 +17,7 @@ import (
 	"cinema/internal/images"
 	"cinema/internal/scanner"
 	"cinema/internal/server"
+	"cinema/internal/settings"
 	"cinema/internal/subtitles"
 	"cinema/internal/tmdb"
 	"cinema/internal/transcode"
@@ -38,7 +39,26 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client := tmdb.New(cfg.TMDBToken, cfg.TMDBLanguage)
+	// Settings saved in the UI take precedence over the environment.
+	store, err := settings.Open(ctx, database, settings.Values{
+		TMDBToken:         cfg.TMDBToken,
+		TMDBLanguage:      cfg.TMDBLanguage,
+		SubtitleLanguages: cfg.SubtitleLanguages,
+		FFmpegPath:        cfg.FFmpegPath,
+		FFprobePath:       cfg.FFprobePath,
+	})
+	if err != nil {
+		log.Fatalf("load settings: %v", err)
+	}
+	if err := store.SeedFolders(ctx, cfg.MoviesDir, cfg.TVDir); err != nil {
+		log.Fatalf("add library folders from environment: %v", err)
+	}
+	conf := store.Values()
+	if conf.TMDBToken == "" {
+		log.Print("no TMDB token set: add one in Settings before scanning")
+	}
+
+	client := tmdb.New(conf.TMDBToken, conf.TMDBLanguage)
 	imgCache := images.New(cfg.CacheDir, database, client)
 	// HLS transcoding for MKVs and subtitles, when ffmpeg is available. The
 	// scanner indexes each file (subtitle tracks, and keyframes for MKVs) and
@@ -46,7 +66,9 @@ func main() {
 	var media server.Media
 	var indexer scanner.Indexer
 	var extractor scanner.SubtitleExtractor
-	if tc, err := transcode.New(cfg.FFmpegPath, cfg.FFprobePath); err != nil {
+	var mediaErr string
+	if tc, err := transcode.New(conf.FFmpegPath, conf.FFprobePath); err != nil {
+		mediaErr = err.Error()
 		log.Printf("transcoding and subtitles disabled, files will be served as-is: %v", err)
 	} else {
 		media.Store = transcode.NewStore(database, tc)
@@ -55,15 +77,34 @@ func main() {
 			log.Fatalf("hls: %v", err)
 		}
 		defer media.HLS.Close()
-		media.Subtitles, err = subtitles.New(tc.FFmpeg(), filepath.Join(cfg.CacheDir, "subtitles"), cfg.SubtitleLanguages, media.Store)
+		media.Subtitles, err = subtitles.New(tc.FFmpeg(), filepath.Join(cfg.CacheDir, "subtitles"), conf.SubtitleLanguages, media.Store)
 		if err != nil {
-			log.Fatalf("SUBTITLE_LANGUAGES: %v", err)
+			log.Fatalf("subtitle languages: %v", err)
 		}
 		extractor = media.Subtitles
 		defer media.Subtitles.Close()
 	}
-	sc := scanner.New(ctx, database, client, imgCache, indexer, extractor, cfg.MoviesDir, cfg.TVDir)
+	// Apply changed settings right away; ffmpeg paths need a restart.
+	store.OnChange(func(v settings.Values) {
+		client.SetToken(v.TMDBToken)
+		client.SetLanguage(v.TMDBLanguage)
+		if media.Subtitles != nil {
+			if err := media.Subtitles.SetPreferences(v.SubtitleLanguages); err != nil {
+				log.Printf("subtitle languages: %v", err)
+			}
+		}
+	})
+
+	sc := scanner.New(ctx, database, client, imgCache, indexer, extractor, store)
 	srv := server.New(database, sc, imgCache, web.Dist(), media)
+	srv.Admin = server.Admin{
+		Settings: store,
+		TMDB:     client,
+		Info: server.Info{
+			Port: cfg.Port, DBPath: cfg.DBPath, CacheDir: cfg.CacheDir,
+			FFmpegPath: conf.FFmpegPath, FFprobePath: conf.FFprobePath, MediaError: mediaErr,
+		},
+	}
 
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -73,7 +114,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("cinema listening on http://localhost:%s (movies: %s, tv: %s)", cfg.Port, cfg.MoviesDir, cfg.TVDir)
+		log.Printf("cinema listening on http://localhost:%s", cfg.Port)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}

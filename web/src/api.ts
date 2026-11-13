@@ -3,6 +3,8 @@ export interface LibraryItem {
   title: string;
   year: number | null;
   posterUrl: string | null;
+  // When its most recent file was added to the library (RFC 3339).
+  addedAt: string | null;
 }
 
 export interface Library {
@@ -73,6 +75,8 @@ export interface ScanStatus {
   // Progress through the current phase, when it reports any (0/0 otherwise).
   phaseDone: number;
   phaseTotal: number;
+  // Another scan runs when this one finishes.
+  queued: boolean;
   ignored: string[];
   errors: string[];
 }
@@ -98,6 +102,53 @@ export interface SubtitleTrack {
   url: string;
 }
 
+export interface Settings {
+  tmdbTokenSet: boolean;
+  tmdbTokenSource: "settings" | "environment" | "";
+  tmdbLanguage: string;
+  subtitleLanguages: string[];
+  ffmpegPath: string;
+  ffprobePath: string;
+  defaults: {
+    tmdbLanguage: string;
+    subtitleLanguages: string[];
+    ffmpegPath: string;
+    ffprobePath: string;
+  };
+  media: { available: boolean; error: string | null; restartRequired: boolean };
+  server: { port: string; dbPath: string; cacheDir: string };
+}
+
+// A change to settings: omitted fields are left alone, and an empty string
+// restores the default.
+export interface SettingsPatch {
+  tmdbToken?: string;
+  tmdbLanguage?: string;
+  subtitleLanguages?: string[];
+  ffmpegPath?: string;
+  ffprobePath?: string;
+}
+
+export type FolderKind = "movie" | "tv";
+
+export interface LibraryFolder {
+  id: number;
+  kind: FolderKind;
+  path: string;
+  addedAt: string;
+  exists: boolean;
+  // Movies or shows in the library from this folder, and their files.
+  titles: number;
+  files: number;
+}
+
+export interface BrowseResult {
+  path: string;
+  parent: string | null;
+  home: string;
+  dirs: { name: string; path: string }[];
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   const body = await res.json().catch(() => null);
@@ -113,9 +164,19 @@ export const api = {
   show: (id: string) => request<Show>(`/api/shows/${id}`),
   episode: (id: string) => request<Episode>(`/api/episodes/${id}`),
   scanStatus: () => request<ScanStatus>("/api/scan"),
-  startScan: () => request<ScanStatus>("/api/scan", { method: "POST" }),
+  startScan: (refresh = false) => request<ScanStatus>(`/api/scan${refresh ? "?refresh=1" : ""}`, { method: "POST" }),
   playback: (fileId: number) => request<Playback>(`/api/playback/${fileId}`),
+  settings: () => request<Settings>("/api/settings"),
+  updateSettings: (patch: SettingsPatch) => request<Settings>("/api/settings", json("PUT", patch)),
+  folders: () => request<LibraryFolder[]>("/api/folders"),
+  addFolder: (kind: FolderKind, path: string) => request<LibraryFolder>("/api/folders", json("POST", { kind, path })),
+  removeFolder: (id: number) => request<{ filesRemoved: number }>(`/api/folders/${id}`, { method: "DELETE" }),
+  browse: (path?: string) => request<BrowseResult>(`/api/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
 };
+
+function json(method: string, body: unknown): RequestInit {
+  return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+}
 
 export const episodeCode = (season: number, episode: number) =>
   `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;

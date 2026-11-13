@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,11 +15,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"cinema/internal/db"
 	"cinema/internal/images"
 	"cinema/internal/scanner"
 	"cinema/internal/server"
+	"cinema/internal/settings"
 	"cinema/internal/subtitles"
 	"cinema/internal/tmdb"
 	"cinema/internal/transcode"
@@ -222,7 +225,8 @@ func TestEndToEnd(t *testing.T) {
 	client := tmdb.New("test-token", "en-US")
 	client.BaseURL, client.ImageBaseURL = fake.URL, fake.URL+"/img"
 	img := images.New(filepath.Join(tmp, "cache"), database, client)
-	sc := scanner.New(context.Background(), database, client, img, nil, nil, moviesDir, tvDir)
+	sc := scanner.New(context.Background(), database, client, img, nil, nil,
+		scanner.StaticFolders{Movies: []string{moviesDir}, TV: []string{tvDir}})
 
 	st := sc.Run(context.Background(), false)
 	if len(st.Errors) > 0 {
@@ -532,4 +536,208 @@ func testPlayback(t *testing.T, database *sql.DB, sc *scanner.Scanner, img *imag
 func itoa(i int) string {
 	b, _ := json.Marshal(i)
 	return string(b)
+}
+
+func doJSON(t *testing.T, h http.Handler, method, url, body string, v any) int {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(method, url, strings.NewReader(body)))
+	if v != nil {
+		if err := json.Unmarshal(rec.Body.Bytes(), v); err != nil {
+			t.Fatalf("%s %s: %v: %s", method, url, err, rec.Body.String())
+		}
+	}
+	return rec.Code
+}
+
+func TestSettingsAndFolders(t *testing.T) {
+	tmp := t.TempDir()
+	movies1, movies2, tvDir := filepath.Join(tmp, "movies1"), filepath.Join(tmp, "movies2"), filepath.Join(tmp, "tv")
+	writeFile(t, filepath.Join(movies1, "Big Buck Bunny (2008)", "Big Buck Bunny (2008).mp4"), "bunny")
+	writeFile(t, filepath.Join(tvDir, "Test Show (2020)", "Season 01", "Test Show (2020) - s01e01.mkv"), "ep1")
+	os.MkdirAll(movies2, 0o755)
+	os.MkdirAll(filepath.Join(tmp, ".hidden"), 0o755)
+
+	fake := newFakeTMDB(t)
+	database, err := db.Open(filepath.Join(tmp, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	store, err := settings.Open(ctx, database, settings.Values{TMDBLanguage: "en-US", FFmpegPath: "ffmpeg", FFprobePath: "ffprobe"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SeedFolders(ctx, movies1, filepath.Join(tmp, "unmounted")); err != nil {
+		t.Fatal(err)
+	}
+	client := tmdb.New("", "en-US")
+	client.BaseURL, client.ImageBaseURL = fake.URL, fake.URL+"/img"
+	store.OnChange(func(v settings.Values) { client.SetToken(v.TMDBToken); client.SetLanguage(v.TMDBLanguage) })
+	img := images.New(filepath.Join(tmp, "cache"), database, client)
+	sc := scanner.New(ctx, database, client, img, nil, nil, store)
+	srv := server.New(database, sc, img, fstest.MapFS{}, server.Media{})
+	srv.Admin = server.Admin{Settings: store, TMDB: client, Info: server.Info{Port: "8080", FFmpegPath: "ffmpeg", FFprobePath: "ffprobe"}}
+	h := srv.Handler()
+
+	// ---- no token: scanning refuses
+	if st := sc.Run(ctx, false); len(st.Errors) != 1 || !strings.Contains(st.Errors[0], "TMDB token") {
+		t.Errorf("scan without token: %v", st.Errors)
+	}
+
+	// ---- settings
+	type settingsResp struct {
+		TMDBTokenSet      bool     `json:"tmdbTokenSet"`
+		TMDBTokenSource   string   `json:"tmdbTokenSource"`
+		TMDBLanguage      string   `json:"tmdbLanguage"`
+		SubtitleLanguages []string `json:"subtitleLanguages"`
+		Media             struct {
+			RestartRequired bool `json:"restartRequired"`
+		} `json:"media"`
+	}
+	var sr settingsResp
+	if code := doJSON(t, h, "GET", "/api/settings", "", &sr); code != 200 || sr.TMDBTokenSet || sr.TMDBLanguage != "en-US" || sr.SubtitleLanguages == nil {
+		t.Errorf("GET settings = %d %+v", code, sr)
+	}
+	for body, want := range map[string]int{
+		`{"tmdbToken": "wrong"}`:                400,
+		`{"tmdbLanguage": "english"}`:           400,
+		`{"subtitleLanguages": ["klingonese"]}`: 400,
+		`{"ffmpegPath": "/no/such/ffmpeg"}`:     400,
+		`{"bogus": 1}`:                          400,
+	} {
+		if code := doJSON(t, h, "PUT", "/api/settings", body, nil); code != want {
+			t.Errorf("PUT %s = %d, want %d", body, code, want)
+		}
+	}
+	sr = settingsResp{}
+	code := doJSON(t, h, "PUT", "/api/settings", `{"tmdbToken": " test-token ", "tmdbLanguage": "fr-FR", "subtitleLanguages": ["en", "fre", "en"]}`, &sr)
+	if code != 200 || !sr.TMDBTokenSet || sr.TMDBTokenSource != "settings" || sr.TMDBLanguage != "fr-FR" || strings.Join(sr.SubtitleLanguages, ",") != "en,fre" {
+		t.Errorf("PUT settings = %d %+v", code, sr)
+	}
+	if !client.HasToken() {
+		t.Error("token not applied to the client")
+	}
+	// Saved settings survive a reload; an empty string restores the default.
+	doJSON(t, h, "PUT", "/api/settings", `{"tmdbLanguage": ""}`, nil)
+	reloaded, _ := settings.Open(ctx, database, settings.Values{TMDBLanguage: "en-US"})
+	if v := reloaded.Values(); v.TMDBToken != "test-token" || v.TMDBLanguage != "en-US" || len(v.SubtitleLanguages) != 2 {
+		t.Errorf("reloaded values = %+v", v)
+	}
+
+	// ---- folders
+	type folder struct {
+		ID     int64  `json:"id"`
+		Kind   string `json:"kind"`
+		Path   string `json:"path"`
+		Exists bool   `json:"exists"`
+		Titles int    `json:"titles"`
+		Files  int    `json:"files"`
+	}
+	var folders []folder
+	doJSON(t, h, "GET", "/api/folders", "", &folders)
+	if len(folders) != 2 || folders[1].Kind != "tv" || folders[1].Exists {
+		t.Fatalf("seeded folders = %+v", folders)
+	}
+	unmounted := folders[1].ID
+	for body, want := range map[string]int{
+		`{"kind": "movie", "path": "relative/dir"}`:                                         400,
+		`{"kind": "movie", "path": "` + filepath.Join(tmp, "nope") + `"}`:                   400,
+		`{"kind": "movie", "path": "` + movies1 + `"}`:                                      400, // duplicate
+		`{"kind": "tv", "path": "` + filepath.Join(movies1, "Big Buck Bunny (2008)") + `"}`: 400, // nested
+		`{"kind": "tv", "path": "` + tmp + `"}`:                                             400, // contains others
+		`{"kind": "music", "path": "` + tvDir + `"}`:                                        400,
+	} {
+		if code := doJSON(t, h, "POST", "/api/folders", body, nil); code != want {
+			t.Errorf("POST folders %s = %d, want %d", body, code, want)
+		}
+	}
+	if code := doJSON(t, h, "DELETE", fmt.Sprintf("/api/folders/%d", unmounted), "", nil); code != 200 {
+		t.Errorf("DELETE folder = %d", code)
+	}
+	var added folder
+	if code := doJSON(t, h, "POST", "/api/folders", `{"kind": "tv", "path": "`+tvDir+`"}`, &added); code != 201 || added.Path != tvDir {
+		t.Errorf("POST tv folder = %d %+v", code, added)
+	}
+	if code := doJSON(t, h, "POST", "/api/folders", `{"kind": "movie", "path": "`+movies2+`"}`, nil); code != 201 {
+		t.Errorf("POST movie folder = %d", code)
+	}
+	// Adding folders scanned them (the second add queued a scan after the
+	// first one).
+	waitForScan(t, sc)
+	if st := sc.Status(); len(st.Errors) > 0 || st.FilesSeen != 2 {
+		t.Errorf("scan = %+v", st)
+	}
+	if n := count(t, database, `SELECT COUNT(*) FROM files`); n != 2 {
+		t.Errorf("files = %d", n)
+	}
+	doJSON(t, h, "GET", "/api/folders", "", &folders)
+	counts := map[string][2]int{}
+	for _, f := range folders {
+		counts[f.Path] = [2]int{f.Titles, f.Files}
+	}
+	if counts[movies1] != [2]int{1, 1} || counts[movies2] != [2]int{0, 0} || counts[tvDir] != [2]int{1, 1} {
+		t.Errorf("folder counts = %v", counts)
+	}
+
+	// An unreadable folder keeps its files in the library.
+	os.Rename(movies1, movies1+".off")
+	if st := sc.Run(ctx, false); st.FilesRemoved != 0 || len(st.Errors) != 1 {
+		t.Errorf("scan with missing folder = %+v", st)
+	}
+	os.Rename(movies1+".off", movies1)
+	if n := count(t, database, `SELECT COUNT(*) FROM files WHERE library = 'movie'`); n != 1 {
+		t.Errorf("movie files = %d", n)
+	}
+
+	// Removing a folder removes its files right away.
+	var removed struct {
+		FilesRemoved int `json:"filesRemoved"`
+	}
+	for _, f := range folders {
+		if f.Path == movies1 {
+			doJSON(t, h, "DELETE", fmt.Sprintf("/api/folders/%d", f.ID), "", &removed)
+		}
+	}
+	if removed.FilesRemoved != 1 || count(t, database, `SELECT COUNT(*) FROM files WHERE library = 'movie'`) != 0 {
+		t.Errorf("remove folder: %+v", removed)
+	}
+	if code := doJSON(t, h, "DELETE", "/api/folders/9999", "", nil); code != 404 {
+		t.Errorf("DELETE missing folder = %d", code)
+	}
+
+	// ---- browse
+	var br struct {
+		Path   string  `json:"path"`
+		Parent *string `json:"parent"`
+		Dirs   []struct {
+			Name string `json:"name"`
+		} `json:"dirs"`
+	}
+	if code := doJSON(t, h, "GET", "/api/browse?path="+tmp, "", &br); code != 200 || br.Parent == nil {
+		t.Fatalf("browse = %d %+v", code, br)
+	}
+	var names []string
+	for _, d := range br.Dirs {
+		names = append(names, d.Name)
+	}
+	if strings.Join(names, ",") != "cache,movies1,movies2,tv" {
+		t.Errorf("browse dirs = %v", names)
+	}
+	if code := doJSON(t, h, "GET", "/api/browse?path="+filepath.Join(tmp, "nope"), "", nil); code != 400 {
+		t.Errorf("browse missing = %d", code)
+	}
+}
+
+// waitForScan waits for background scans (started by adding folders) to end.
+func waitForScan(t *testing.T, sc *scanner.Scanner) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for st := sc.Status(); st.Running || st.Queued; st = sc.Status() {
+		if time.Now().After(deadline) {
+			t.Fatal("scan didn't finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

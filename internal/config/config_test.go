@@ -21,9 +21,9 @@ func TestExpandHome(t *testing.T) {
 		"ffmpeg":         "ffmpeg",
 		"":               "",
 	} {
-		got, err := expandHome(in)
+		got, err := ExpandHome(in)
 		if err != nil || got != want {
-			t.Errorf("expandHome(%q) = %q, %v; want %q", in, got, err, want)
+			t.Errorf("ExpandHome(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
 }

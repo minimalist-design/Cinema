@@ -1,0 +1,23 @@
+/* Let the hover zoom and focus ring show without being clipped. */
+.scroller {
+  margin-inline: calc(var(--mantine-spacing-xs) * -1);
+}
+
+.track {
+  display: flex;
+  gap: var(--mantine-spacing-md);
+  padding: var(--mantine-spacing-xs);
+}
+
+.item {
+  flex: 0 0 auto;
+  width: 132px;
+
+  @media (min-width: $mantine-breakpoint-sm) {
+    width: 160px;
+  }
+
+  @media (min-width: $mantine-breakpoint-lg) {
+    width: 176px;
+  }
+}

@@ -30,6 +30,9 @@ type Server struct {
 	images  *images.Cache
 	web     fs.FS
 	Media
+	// Admin enables the settings and library folder endpoints; set it
+	// before calling Handler.
+	Admin Admin
 }
 
 // Media holds the parts that need ffmpeg. They're all nil when it isn't
@@ -57,6 +60,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/subtitles/{id}/{track}", s.subtitle)
 	mux.HandleFunc("GET /api/scan", s.scanStatus)
 	mux.HandleFunc("POST /api/scan", s.startScan)
+	s.adminRoutes(mux)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
@@ -101,6 +105,8 @@ type libraryItem struct {
 	Title     string  `json:"title"`
 	Year      *int    `json:"year"`
 	PosterURL *string `json:"posterUrl"`
+	// When its most recent file was added to the library.
+	AddedAt *string `json:"addedAt"`
 }
 
 func (s *Server) library(w http.ResponseWriter, r *http.Request) {
@@ -113,24 +119,27 @@ func (s *Server) library(w http.ResponseWriter, r *http.Request) {
 		items := []libraryItem{}
 		for rows.Next() {
 			var it libraryItem
-			var date, poster sql.NullString
-			if err := rows.Scan(&it.ID, &it.Title, &date, &poster); err != nil {
+			var date, poster, added sql.NullString
+			if err := rows.Scan(&it.ID, &it.Title, &date, &poster, &added); err != nil {
 				return nil, err
 			}
-			it.Year, it.PosterURL = year(date), imageURL(posterSize, poster)
+			it.Year, it.PosterURL, it.AddedAt = year(date), imageURL(posterSize, poster), nullStr(added)
 			items = append(items, it)
 		}
 		return items, rows.Err()
 	}
-	movies, err := query(`SELECT m.id, m.title, m.release_date, m.poster_path FROM movies m
-		WHERE EXISTS (SELECT 1 FROM files f WHERE f.movie_id = m.id)
+	movies, err := query(`SELECT m.id, m.title, m.release_date, m.poster_path, MAX(f.added_at) FROM movies m
+		JOIN files f ON f.movie_id = m.id
+		GROUP BY m.id
 		ORDER BY m.title COLLATE NOCASE`)
 	if err != nil {
 		serverError(w, err)
 		return
 	}
-	shows, err := query(`SELECT s.id, s.name, s.first_air_date, s.poster_path FROM tv_shows s
-		WHERE EXISTS (SELECT 1 FROM files f JOIN episodes e ON e.id = f.episode_id WHERE e.show_id = s.id)
+	shows, err := query(`SELECT s.id, s.name, s.first_air_date, s.poster_path, MAX(f.added_at) FROM tv_shows s
+		JOIN episodes e ON e.show_id = s.id
+		JOIN files f ON f.episode_id = e.id
+		GROUP BY s.id
 		ORDER BY s.name COLLATE NOCASE`)
 	if err != nil {
 		serverError(w, err)

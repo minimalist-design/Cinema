@@ -65,8 +65,10 @@ type Library interface {
 type Service struct {
 	ffmpeg   string
 	cacheDir string
-	prefs    []language.Base
 	lib      Library
+
+	prefsMu sync.RWMutex
+	prefs   []language.Base
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -93,18 +95,45 @@ func New(ffmpeg, cacheDir string, prefs []string, lib Library) (*Service, error)
 			os.RemoveAll(t)
 		}
 	}
-	for _, p := range prefs {
-		if p = strings.TrimSpace(p); p == "" {
-			continue
-		}
-		b, ok := parseLanguage(p)
-		if !ok {
-			return nil, fmt.Errorf("unknown subtitle language %q", p)
-		}
-		s.prefs = append(s.prefs, b)
+	if err := s.SetPreferences(prefs); err != nil {
+		return nil, err
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	return s, nil
+}
+
+// SetPreferences replaces the preferred subtitle languages (see New).
+func (s *Service) SetPreferences(prefs []string) error {
+	bases, err := parseLanguages(prefs)
+	if err != nil {
+		return err
+	}
+	s.prefsMu.Lock()
+	s.prefs = bases
+	s.prefsMu.Unlock()
+	return nil
+}
+
+// ValidateLanguages checks that every code is a language SetPreferences
+// accepts.
+func ValidateLanguages(codes []string) error {
+	_, err := parseLanguages(codes)
+	return err
+}
+
+func parseLanguages(codes []string) ([]language.Base, error) {
+	var out []language.Base
+	for _, c := range codes {
+		if c = strings.TrimSpace(c); c == "" {
+			continue
+		}
+		b, ok := parseLanguage(c)
+		if !ok {
+			return nil, fmt.Errorf("unknown subtitle language %q", c)
+		}
+		out = append(out, b)
+	}
+	return out, nil
 }
 
 // Close stops running extractions.
@@ -288,7 +317,10 @@ func label(tracks []Track) {
 // Side files come first, so a downloaded subtitle beats the built-in one.
 // Without preferences, it's the track flagged default in the file.
 func (s *Service) pickDefault(tracks []Track) int {
-	if len(s.prefs) == 0 {
+	s.prefsMu.RLock()
+	prefs := s.prefs
+	s.prefsMu.RUnlock()
+	if len(prefs) == 0 {
 		for i, t := range tracks {
 			if t.flagged {
 				return i
@@ -296,7 +328,7 @@ func (s *Service) pickDefault(tracks []Track) int {
 		}
 		return -1
 	}
-	for _, pref := range s.prefs {
+	for _, pref := range prefs {
 		lang := pref.String()
 		for _, ok := range []func(Track) bool{
 			func(t Track) bool { return !t.Forced && !t.HearingImpaired },

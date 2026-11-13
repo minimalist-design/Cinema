@@ -1,250 +1,141 @@
-import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
-import {
-  Accordion,
-  Badge,
-  Box,
-  Button,
-  Code,
-  Group,
-  Paper,
-  Progress,
-  ScrollArea,
-  SimpleGrid,
-  Stack,
-  Tabs,
-  Text,
-  TextInput,
-  UnstyledButton,
-} from "@mantine/core";
-import { useDocumentTitle, useLocalStorage } from "@mantine/hooks";
-import { api, type LibraryItem, type ScanStatus } from "../api";
+import { useMemo } from "react";
+import { Link, useSearchParams } from "react-router-dom";
+import { Button, Group, List, Loader, Paper, Stack, Text, ThemeIcon, Title } from "@mantine/core";
+import { useDocumentTitle } from "@mantine/hooks";
+import { api, type Library } from "../api";
 import { useFetch } from "../useFetch";
-import { Artwork } from "../components/Artwork";
+import { useScan } from "../scan";
+import { MediaRow } from "../components/MediaRow";
+import { PosterGrid, type MediaItem } from "../components/PosterCard";
+import { SearchBox } from "../components/SearchBox";
 import { ErrorAlert, Message, PageLoader } from "../components/States";
-import { RefreshIcon, SearchIcon } from "../components/icons";
-import classes from "./Home.module.css";
+import { SettingsIcon } from "../components/icons";
 
-function PosterCard({ item, to }: { item: LibraryItem; to: string }) {
+const ROW_LIMIT = 40;
+
+export function toItems(lib: Library) {
+  const movies: MediaItem[] = lib.movies.map((m) => ({ ...m, kind: "movie" }));
+  const shows: MediaItem[] = lib.shows.map((s) => ({ ...s, kind: "show" }));
+  return { movies, shows };
+}
+
+const matches = (item: MediaItem, q: string) => item.title.toLowerCase().includes(q) || String(item.year ?? "").includes(q);
+
+function SearchResults({ q, movies, shows }: { q: string; movies: MediaItem[]; shows: MediaItem[] }) {
+  const m = movies.filter((i) => matches(i, q));
+  const s = shows.filter((i) => matches(i, q));
+  if (m.length + s.length === 0) return <Message title="No matches" description={`Nothing in your library matches “${q}”.`} />;
   return (
-    <UnstyledButton component={Link} to={to} className={classes.card}>
-      <Artwork src={item.posterUrl} ratio={2 / 3} />
-      <Text fw={500} size="sm" mt="xs" lineClamp={2}>
-        {item.title}
-      </Text>
-      {item.year ? (
-        <Text size="xs" c="dimmed">
-          {item.year}
-        </Text>
-      ) : null}
-    </UnstyledButton>
+    <Stack gap="xl">
+      {[
+        { title: "Movies", items: m },
+        { title: "TV Shows", items: s },
+      ].map((section) =>
+        section.items.length > 0 ? (
+          <section key={section.title}>
+            <Title order={2} fz="h3" mb="sm">
+              {section.title}{" "}
+              <Text span c="dimmed" fz="md" fw={400}>
+                {section.items.length}
+              </Text>
+            </Title>
+            <PosterGrid items={section.items} />
+          </section>
+        ) : null,
+      )}
+    </Stack>
   );
 }
 
-function PosterGrid({ items, linkTo, empty }: { items: LibraryItem[]; linkTo: (id: number) => string; empty: string }) {
-  if (items.length === 0) return <Message title={empty} />;
-  return (
-    <SimpleGrid cols={{ base: 2, xs: 3, sm: 4, md: 5, lg: 6 }} spacing="md" verticalSpacing="xl">
-      {items.map((item) => (
-        <PosterCard key={item.id} item={item} to={linkTo(item.id)} />
-      ))}
-    </SimpleGrid>
-  );
-}
+// Shown while the library is empty: what's left to set up.
+function GettingStarted() {
+  const { status } = useScan();
+  const { data: settings } = useFetch(api.settings, []);
+  const { data: folders } = useFetch(api.folders, []);
+  const scanning = !!status?.running;
 
-const phaseLabels: Record<string, string> = {
-  starting: "Starting",
-  "reference data": "Fetching reference data",
-  movies: "Scanning movies",
-  tv: "Scanning TV shows",
-  indexing: "Indexing keyframes",
-  subtitles: "Extracting subtitles",
-};
-
-function FileList({ files }: { files: string[] }) {
-  return (
-    <ScrollArea.Autosize mah={240}>
-      <Stack gap={4}>
-        {files.map((f) => (
-          <Code key={f} block>
-            {f}
-          </Code>
-        ))}
-      </Stack>
-    </ScrollArea.Autosize>
-  );
-}
-
-function ScanPanel({ onFinished }: { onFinished: () => void }) {
-  const [status, setStatus] = useState<ScanStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    api.scanStatus().then(setStatus, () => {});
-  }, []);
-
-  // Poll while a scan is running; refresh the library when it ends.
-  useEffect(() => {
-    if (!status?.running) return;
-    const timer = setInterval(async () => {
-      try {
-        const next = await api.scanStatus();
-        setStatus(next);
-        if (!next.running) onFinished();
-      } catch (e) {
-        setError((e as Error).message);
-      }
-    }, 2000);
-    return () => clearInterval(timer);
-  }, [status?.running, onFinished]);
-
-  const start = async () => {
-    setError(null);
-    try {
-      setStatus(await api.startScan());
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  };
-
-  const running = status?.running ?? false;
-  const hasProgress = running && status!.phaseTotal > 0;
-
-  let summary: string;
-  if (running) {
-    const phase = phaseLabels[status!.phase] ?? status!.phase;
-    const progress = hasProgress ? ` (${status!.phaseDone} of ${status!.phaseTotal})` : "";
-    summary = `${phase}${progress} · ${status!.filesSeen} files seen, ${status!.filesLinked} linked`;
-  } else if (status?.finishedAt) {
-    const parts = [
-      `${status.filesLinked} linked`,
-      `${status.filesIgnored} ignored`,
-      `${status.filesRemoved} removed`,
-      `${status.filesIndexed} indexed`,
-    ];
-    if (status.subtitlesExtracted > 0) parts.push(`subtitles extracted from ${status.subtitlesExtracted} files`);
-    summary = `Last scan ${new Date(status.finishedAt).toLocaleString()}: ${parts.join(", ")}`;
-  } else {
-    summary = "Not scanned yet. Scan to pick up files from your movie and TV folders.";
+  if (scanning) {
+    return (
+      <Message
+        title={
+          <Group gap="xs" justify="center">
+            <Loader size="xs" /> Scanning your library
+          </Group>
+        }
+        description="Titles show up here once the scan is done."
+      />
+    );
   }
+  if (!settings || !folders) return <PageLoader />;
 
-  const showDetails = !running && status && (status.ignored.length > 0 || status.errors.length > 0);
-
+  const steps = [
+    { done: settings.tmdbTokenSet, label: "Add your TMDB token, used to fetch posters and details", to: "/settings/metadata" },
+    { done: folders.length > 0, label: "Add the folders that hold your movies and TV shows", to: "/settings/library" },
+    { done: false, label: "Scan the library", to: "/settings/library" },
+  ];
+  const next = steps.find((s) => !s.done)!;
   return (
-    <Paper withBorder p="md">
-      <Group justify="space-between" wrap="nowrap" align="center">
-        <Box miw={0}>
-          <Text fw={600}>Library</Text>
-          <Text size="sm" c="dimmed">
-            {summary}
-          </Text>
-        </Box>
-        <Button onClick={start} loading={running} loaderProps={{ type: "dots" }} leftSection={<RefreshIcon />} variant="light" style={{ flexShrink: 0 }}>
-          Rescan
-        </Button>
-      </Group>
-
-      {running ? (
-        <Progress
-          mt="md"
-          size="sm"
-          value={hasProgress ? (status!.phaseDone / status!.phaseTotal) * 100 : 100}
-          striped={!hasProgress}
-          animated={!hasProgress}
-          aria-label="Scan progress"
-        />
-      ) : null}
-
-      {error ? (
-        <Text size="sm" c="red" mt="sm" role="alert">
-          {error}
-        </Text>
-      ) : null}
-
-      {showDetails ? (
-        <Accordion variant="contained" mt="md" chevronPosition="left">
-          {status.ignored.length > 0 ? (
-            <Accordion.Item value="ignored">
-              <Accordion.Control>
-                <Group gap="xs">
-                  <Text size="sm">Ignored files</Text>
-                  <Badge size="sm" variant="light" color="gray">
-                    {status.ignored.length}
-                  </Badge>
-                </Group>
-              </Accordion.Control>
-              <Accordion.Panel>
-                <FileList files={status.ignored} />
-              </Accordion.Panel>
-            </Accordion.Item>
-          ) : null}
-          {status.errors.length > 0 ? (
-            <Accordion.Item value="errors">
-              <Accordion.Control>
-                <Group gap="xs">
-                  <Text size="sm">Errors</Text>
-                  <Badge size="sm" variant="light" color="red">
-                    {status.errors.length}
-                  </Badge>
-                </Group>
-              </Accordion.Control>
-              <Accordion.Panel>
-                <FileList files={status.errors} />
-              </Accordion.Panel>
-            </Accordion.Item>
-          ) : null}
-        </Accordion>
-      ) : null}
+    <Paper withBorder p="xl" maw={560} mx="auto" mt="xl">
+      <Title order={2} fz="h3">
+        Set up your library
+      </Title>
+      <Text c="dimmed" mt={4} mb="lg">
+        Your library is empty. A few steps and it fills up with posters.
+      </Text>
+      <List spacing="sm" center>
+        {steps.map((s, i) => (
+          <List.Item
+            key={s.label}
+            icon={
+              <ThemeIcon size={24} radius="xl" color={s.done ? "teal" : "gray"} variant={s.done ? "filled" : "light"}>
+                <Text fz="xs" fw={700}>
+                  {s.done ? "✓" : i + 1}
+                </Text>
+              </ThemeIcon>
+            }
+          >
+            <Text c={s.done ? "dimmed" : undefined} td={s.done ? "line-through" : undefined}>
+              {s.label}
+            </Text>
+          </List.Item>
+        ))}
+      </List>
+      <Button component={Link} to={next.to} mt="xl" leftSection={<SettingsIcon />}>
+        Open settings
+      </Button>
     </Paper>
   );
 }
 
-function matches(item: LibraryItem, query: string) {
-  return item.title.toLowerCase().includes(query) || String(item.year ?? "").includes(query);
-}
-
 export default function Home() {
   useDocumentTitle("Cinema");
-  const { data, error, loading, reload } = useFetch(api.library, []);
-  const [query, setQuery] = useState("");
-  const [tab, setTab] = useLocalStorage<string>({ key: "cinema-home-tab", defaultValue: "movies" });
+  const [params] = useSearchParams();
+  const q = (params.get("q") ?? "").trim().toLowerCase();
+  const { finished } = useScan();
+  const { data, error, loading } = useFetch(api.library, [finished]);
 
-  const q = query.trim().toLowerCase();
-  const movies = useMemo(() => (data ? data.movies.filter((m) => matches(m, q)) : []), [data, q]);
-  const shows = useMemo(() => (data ? data.shows.filter((s) => matches(s, q)) : []), [data, q]);
+  const items = useMemo(() => (data ? toItems(data) : null), [data]);
+  const recent = useMemo(() => {
+    if (!items) return [];
+    return [...items.movies, ...items.shows]
+      .filter((i) => i.addedAt)
+      .sort((a, b) => b.addedAt!.localeCompare(a.addedAt!))
+      .slice(0, 20);
+  }, [items]);
 
   return (
-    <Stack gap="lg">
-      <ScanPanel onFinished={reload} />
+    <Stack gap={40}>
+      <SearchBox hiddenFrom="sm" />
       {error ? <ErrorAlert>{error}</ErrorAlert> : null}
-      {loading && !data ? <PageLoader /> : null}
-      {data ? (
-        <Tabs value={tab} onChange={(v) => v && setTab(v)} keepMounted={false}>
-          <Group justify="space-between" align="flex-end" gap="sm" mb="lg">
-            <Tabs.List>
-              <Tabs.Tab value="movies" rightSection={<Badge size="sm" variant="light" color="gray">{movies.length}</Badge>}>
-                Movies
-              </Tabs.Tab>
-              <Tabs.Tab value="shows" rightSection={<Badge size="sm" variant="light" color="gray">{shows.length}</Badge>}>
-                TV Shows
-              </Tabs.Tab>
-            </Tabs.List>
-            <TextInput
-              placeholder="Filter by title or year"
-              aria-label="Filter by title or year"
-              leftSection={<SearchIcon />}
-              value={query}
-              onChange={(e) => setQuery(e.currentTarget.value)}
-              w={{ base: "100%", xs: 260 }}
-            />
-          </Group>
-          <Tabs.Panel value="movies">
-            <PosterGrid items={movies} linkTo={(id) => `/watch/movie/${id}`} empty={q ? "No movies match" : "No movies yet"} />
-          </Tabs.Panel>
-          <Tabs.Panel value="shows">
-            <PosterGrid items={shows} linkTo={(id) => `/shows/${id}`} empty={q ? "No shows match" : "No TV shows yet"} />
-          </Tabs.Panel>
-        </Tabs>
+      {loading && !items ? <PageLoader /> : null}
+      {items && q ? <SearchResults q={q} movies={items.movies} shows={items.shows} /> : null}
+      {items && !q && items.movies.length + items.shows.length === 0 ? <GettingStarted /> : null}
+      {items && !q ? (
+        <>
+          <MediaRow title="Recently added" items={recent} withKind />
+          <MediaRow title="Movies" items={items.movies.slice(0, ROW_LIMIT)} seeAll="/movies" />
+          <MediaRow title="TV Shows" items={items.shows.slice(0, ROW_LIMIT)} seeAll="/shows" />
+        </>
       ) : null}
     </Stack>
   );

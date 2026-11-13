@@ -4,39 +4,46 @@ A small media server for movies and TV shows. Written in Go with SQLite, it pull
 
 ## Setup
 
-Add these to `.env` in the project root:
+```sh
+make build     # npm install + vite build, then go build (frontend embedded)
+./cinema       # open http://localhost:8080
+make test      # go test ./...
+```
 
-| Variable | Required | Default |
+Then open **Settings** (the gear icon), add your [TMDB](https://www.themoviedb.org/settings/api) API Read Access Token under *Metadata*, and your movie and TV folders under *Library*. Adding a folder scans it.
+
+### Settings
+
+Everything except the server's own port and storage can be changed in the Settings page. Those values are saved in the database and take precedence over `.env`, which only provides defaults:
+
+| Variable | Default | In Settings |
 |---|---|---|
-| `TMDB_TOKEN` | yes | TMDB API read access token (v4 bearer) |
-| `MOVIES_DIR` | yes | |
-| `TV_DIR` | yes | |
-| `PORT` | | `8080` |
-| `DB_PATH` | | `./data/cinema.db` |
-| `CACHE_DIR` | | `./data/cache` (downloaded images) |
-| `TMDB_LANGUAGE` | | `en-US` |
-| `FFMPEG_PATH` | | `ffmpeg` (looked up on `PATH`) |
-| `FFPROBE_PATH` | | `ffprobe` (looked up on `PATH`) |
-| `SUBTITLE_LANGUAGES` | | Preferred subtitle languages in order, e.g. `eng` or `en,fr` (empty: use the file's default track) |
+| `TMDB_TOKEN` | | Metadata (applies right away) |
+| `TMDB_LANGUAGE` | `en-US` | Metadata (applies to titles fetched from then on) |
+| `MOVIES_DIR`, `TV_DIR` | | Library: added as library folders the first time the server starts, then managed there |
+| `SUBTITLE_LANGUAGES` | | Playback: preferred subtitle languages in order, e.g. `eng` or `en,fr` (empty: the file's default track) |
+| `FFMPEG_PATH` | `ffmpeg` (looked up on `PATH`) | Playback (applies after a restart) |
+| `FFPROBE_PATH` | `ffprobe` (looked up on `PATH`) | Playback (applies after a restart) |
+| `PORT` | `8080` | read-only |
+| `DB_PATH` | `./data/cinema.db` | read-only |
+| `CACHE_DIR` | `./data/cache` (downloaded images) | read-only |
 
 Paths can be absolute, start with `~/` (your home directory), or be relative to the directory you start the server from. The `.env` file is also read from that directory.
 
-```sh
-make build     # npm install + vite build, then go build (frontend embedded)
-./cinema       # open http://localhost:8080 and click "Rescan library"
-make test      # go test ./...
-```
+The server has no login: anyone who can reach it can change its settings, and browse the server's folder names when adding a library folder. Keep it on a trusted network.
 
 For development, run `make dev-server` and `make dev-web` in two terminals, then open http://localhost:5173.
 
 ## Library layout (Plex-style)
 
+There can be any number of movie and TV folders. They can't be inside one another.
+
 ```
-MOVIES_DIR/
+movies folder/
   The Matrix (1999)/The Matrix (1999).mkv
   Heat (1995) {tmdb-949}/Heat (1995).mp4      # optional {tmdb-ID} forces the match
   Alien (1979).mkv                            # loose files work too
-TV_DIR/
+tv folder/
   Breaking Bad (2008)/Season 01/Breaking Bad (2008) - s01e01 - Pilot.mkv
 ```
 
@@ -46,11 +53,13 @@ TV_DIR/
 
 ## Scanning
 
-Scans only run on demand: the UI button, or `curl -X POST localhost:8080/api/scan`.
+Scans run when a library folder is added, and on demand: *Scan for changes* in Settings → Library, or `curl -X POST localhost:8080/api/scan`.
 
 - Unchanged files (same path, size and mtime) aren't re-fetched.
-- `POST /api/scan?refresh=1` re-fetches metadata for every title.
+- *Refresh all metadata* (`POST /api/scan?refresh=1`) re-fetches metadata for every title, e.g. after changing the metadata language.
 - Files removed from disk are dropped from the library. Their metadata is kept.
+- A folder that can't be read during a scan (e.g. an unmounted drive) keeps its files in the library.
+- Removing a library folder removes its files from the library right away. Nothing is deleted from disk.
 
 ## Data
 

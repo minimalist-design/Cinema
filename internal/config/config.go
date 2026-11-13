@@ -1,5 +1,7 @@
 // Package config loads server configuration from the environment and an
-// optional .env file in the working directory.
+// optional .env file in the working directory. Values that can be changed
+// in the UI (see internal/settings) are only defaults: TMDB token and
+// language, library folders, subtitle languages and ffmpeg paths.
 package config
 
 import (
@@ -49,31 +51,18 @@ func Load() (*Config, error) {
 		}
 	}
 	for _, p := range []*string{&c.MoviesDir, &c.TVDir, &c.DBPath, &c.CacheDir, &c.FFmpegPath, &c.FFprobePath} {
-		expanded, err := expandHome(*p)
+		expanded, err := ExpandHome(*p)
 		if err != nil {
 			return nil, err
 		}
 		*p = expanded
 	}
-	var missing []string
-	if c.TMDBToken == "" {
-		missing = append(missing, "TMDB_TOKEN")
-	}
-	if c.MoviesDir == "" {
-		missing = append(missing, "MOVIES_DIR")
-	}
-	if c.TVDir == "" {
-		missing = append(missing, "TV_DIR")
-	}
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("missing required environment variables: %v", missing)
-	}
 	return c, nil
 }
 
-// expandHome replaces a leading "~" or "~/" with the user's home directory,
+// ExpandHome replaces a leading "~" or "~/" with the user's home directory,
 // as a shell would. Other paths, including "~user/...", are returned as is.
-func expandHome(p string) (string, error) {
+func ExpandHome(p string) (string, error) {
 	if p != "~" && !strings.HasPrefix(p, "~/") {
 		return p, nil
 	}

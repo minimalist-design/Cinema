@@ -64,3 +64,69 @@ export const FilmIcon = ({ size = 32 }: { size?: number }) => (
     <path d="M8 4v16M16 4v16M4 8h4m-4 8h4m-4-4h16m-4-4h4m-4 8h4" />
   </Icon>
 );
+
+export const SettingsIcon = () => (
+  <Icon>
+    <path d="M10.3 4.3c.4-1.8 3-1.8 3.4 0a1.7 1.7 0 0 0 2.6 1.1c1.5-.9 3.3.8 2.4 2.4a1.7 1.7 0 0 0 1 2.5c1.8.4 1.8 3 0 3.4a1.7 1.7 0 0 0-1 2.6c.9 1.5-.9 3.3-2.4 2.4a1.7 1.7 0 0 0-2.6 1c-.4 1.8-3 1.8-3.4 0a1.7 1.7 0 0 0-2.5-1c-1.6.9-3.3-.9-2.4-2.4a1.7 1.7 0 0 0-1.1-2.6c-1.8-.4-1.8-3 0-3.4a1.7 1.7 0 0 0 1.1-2.5c-.9-1.6.8-3.3 2.4-2.4 1 .6 2.3 0 2.5-1.1z" />
+    <circle cx="12" cy="12" r="3" />
+  </Icon>
+);
+
+export const FolderIcon = ({ size = 18 }: { size?: number }) => (
+  <Icon size={size}>
+    <path d="M5 4h4l3 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2" />
+  </Icon>
+);
+
+export const TrashIcon = () => (
+  <Icon size={16}>
+    <path d="M4 7h16m-10 4v6m4-6v6M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3" />
+  </Icon>
+);
+
+export const PlusIcon = () => (
+  <Icon size={16}>
+    <path d="M12 5v14m-7-7h14" />
+  </Icon>
+);
+
+export const ArrowUpIcon = () => (
+  <Icon size={16}>
+    <path d="M12 19V5m-6 6 6-6 6 6" />
+  </Icon>
+);
+
+export const HomeIcon = () => (
+  <Icon size={16}>
+    <path d="M5 12H3l9-9 9 9h-2M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7" />
+    <path d="M9 21v-6a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v6" />
+  </Icon>
+);
+
+export const LibraryIcon = () => (
+  <Icon size={16}>
+    <path d="M4 4h4v16H4zm6 0h4v16h-4zm6.5 1.5 3.8-1 3.7 15.4-3.8 1z" />
+  </Icon>
+);
+
+export const InfoIcon = () => (
+  <Icon size={16}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 8h.01M11 12h1v4h1" />
+  </Icon>
+);
+
+export const CaptionsIcon = () => (
+  <Icon size={16}>
+    <rect x="3" y="5" width="18" height="14" rx="2" />
+    <path d="M10.5 10.5a1.5 1.5 0 0 0-3 0v3a1.5 1.5 0 0 0 3 0m6-3a1.5 1.5 0 0 0-3 0v3a1.5 1.5 0 0 0 3 0" />
+  </Icon>
+);
+
+export const ServerIcon = () => (
+  <Icon size={16}>
+    <rect x="3" y="4" width="18" height="7" rx="2" />
+    <rect x="3" y="13" width="18" height="7" rx="2" />
+    <path d="M7 8v.01M7 17v.01" />
+  </Icon>
+);

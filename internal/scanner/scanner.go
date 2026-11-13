@@ -1,4 +1,4 @@
-// Package scanner walks the media directories, matches files to TMDB titles,
+// Package scanner walks the library folders, matches files to TMDB titles,
 // ingests metadata and links files to movies and episodes.
 package scanner
 
@@ -41,10 +41,12 @@ type Status struct {
 	// Files whose built-in subtitles were extracted.
 	SubtitlesExtracted int `json:"subtitlesExtracted"`
 	// Progress through the current phase, when it reports any.
-	PhaseDone  int      `json:"phaseDone"`
-	PhaseTotal int      `json:"phaseTotal"`
-	Ignored    []string `json:"ignored"`
-	Errors     []string `json:"errors"`
+	PhaseDone  int `json:"phaseDone"`
+	PhaseTotal int `json:"phaseTotal"`
+	// Another scan will run when this one finishes.
+	Queued  bool     `json:"queued"`
+	Ignored []string `json:"ignored"`
+	Errors  []string `json:"errors"`
 }
 
 // Indexer prepares linked files for playback after a scan (see
@@ -63,6 +65,19 @@ type SubtitleExtractor interface {
 	ExtractLibrary(ctx context.Context, progress func(done, total int)) (extracted int, errs []error)
 }
 
+// FolderSource lists the library folders. It's asked at the start of each
+// scan, so folders can change between scans (see settings.Store).
+type FolderSource interface {
+	FolderPaths(ctx context.Context) (movies, tv []string, err error)
+}
+
+// StaticFolders is a fixed FolderSource.
+type StaticFolders struct{ Movies, TV []string }
+
+func (f StaticFolders) FolderPaths(context.Context) ([]string, []string, error) {
+	return f.Movies, f.TV, nil
+}
+
 type Scanner struct {
 	ctx       context.Context
 	db        *sql.DB
@@ -70,15 +85,15 @@ type Scanner struct {
 	images    *images.Cache
 	indexer   Indexer           // nil to skip indexing
 	subtitles SubtitleExtractor // nil to skip subtitle extraction
-	moviesDir string
-	tvDir     string
+	folders   FolderSource
 
 	mu     sync.Mutex
 	status Status
+	queued bool // run another scan after the current one
 }
 
-func New(ctx context.Context, db *sql.DB, client *tmdb.Client, img *images.Cache, indexer Indexer, subs SubtitleExtractor, moviesDir, tvDir string) *Scanner {
-	return &Scanner{ctx: ctx, db: db, tmdb: client, images: img, indexer: indexer, subtitles: subs, moviesDir: moviesDir, tvDir: tvDir}
+func New(ctx context.Context, db *sql.DB, client *tmdb.Client, img *images.Cache, indexer Indexer, subs SubtitleExtractor, folders FolderSource) *Scanner {
+	return &Scanner{ctx: ctx, db: db, tmdb: client, images: img, indexer: indexer, subtitles: subs, folders: folders}
 }
 
 // Status returns a snapshot of the scan status.
@@ -86,11 +101,27 @@ func (s *Scanner) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.status
+	st.Queued = s.queued
 	// Copies, never nil: nil slices encode as JSON null, and the UI expects
 	// arrays.
 	st.Ignored = append([]string{}, st.Ignored...)
 	st.Errors = append([]string{}, st.Errors...)
 	return st
+}
+
+// Queue starts a scan in the background, or, if one is running, runs
+// another (without refresh) when it finishes. Use it after the library
+// folders change, so a running scan's results don't go stale.
+func (s *Scanner) Queue() {
+	s.mu.Lock()
+	running := s.status.Running
+	if running {
+		s.queued = true
+	}
+	s.mu.Unlock()
+	if !running {
+		s.Start(false)
+	}
 }
 
 // Start begins a scan in the background. It returns false if a scan is
@@ -117,6 +148,13 @@ func (s *Scanner) Start(refresh bool) bool {
 			st := s.Status()
 			log.Printf("scan finished: %d seen, %d linked, %d ignored, %d removed, %d indexed, %d with subtitles extracted, %d errors",
 				st.FilesSeen, st.FilesLinked, st.FilesIgnored, st.FilesRemoved, st.FilesIndexed, st.SubtitlesExtracted, len(st.Errors))
+			s.mu.Lock()
+			again := s.queued && s.ctx.Err() == nil
+			s.queued = false
+			s.mu.Unlock()
+			if again {
+				s.Start(false)
+			}
 		}()
 		s.run(s.ctx, refresh)
 	}()
@@ -177,6 +215,16 @@ type fileRow struct {
 }
 
 func (s *Scanner) run(ctx context.Context, refresh bool) {
+	if !s.tmdb.HasToken() {
+		s.addError("no TMDB token is set: add one in Settings")
+		return
+	}
+	movieDirs, tvDirs, err := s.folders.FolderPaths(ctx)
+	if err != nil {
+		s.addError("list library folders: " + err.Error())
+		return
+	}
+
 	s.update(func(st *Status) { st.Phase = "reference data" })
 	s.fetchReference(ctx)
 
@@ -187,20 +235,16 @@ func (s *Scanner) run(ctx context.Context, refresh bool) {
 	}
 
 	s.update(func(st *Status) { st.Phase = "movies" })
-	if files, err := walk(s.moviesDir); err != nil {
-		s.addError(fmt.Sprintf("walk movies dir: %v (skipping movie library)", err))
-	} else {
-		seen := s.scanMovies(ctx, files, known, refresh)
-		s.removeMissing(ctx, "movie", seen)
-	}
+	files, failed := s.walkAll(movieDirs)
+	seen := s.scanMovies(ctx, files, known, refresh)
+	keepUnder(failed, known, seen)
+	s.removeMissing(ctx, "movie", seen)
 
 	s.update(func(st *Status) { st.Phase = "tv" })
-	if files, err := walk(s.tvDir); err != nil {
-		s.addError(fmt.Sprintf("walk tv dir: %v (skipping tv library)", err))
-	} else {
-		seen := s.scanTV(ctx, files, known, refresh)
-		s.removeMissing(ctx, "tv", seen)
-	}
+	files, failed = s.walkAll(tvDirs)
+	seen = s.scanTV(ctx, files, known, refresh)
+	keepUnder(failed, known, seen)
+	s.removeMissing(ctx, "tv", seen)
 
 	if s.indexer != nil {
 		s.update(func(st *Status) { st.Phase = "indexing" })
@@ -234,6 +278,35 @@ func (s *Scanner) fetchReference(ctx context.Context) {
 		}
 		if err := ingest.Config(ctx, s.db, key, raw); err != nil {
 			s.addError(fmt.Sprintf("store %s: %v", key, err))
+		}
+	}
+}
+
+// walkAll walks each root, returning the files found and the roots that
+// couldn't be read (an error is reported for each).
+func (s *Scanner) walkAll(roots []string) (files []diskFile, failed []string) {
+	for _, root := range roots {
+		found, err := walk(root)
+		if err != nil {
+			s.addError(fmt.Sprintf("read folder %s: %v (keeping its files in the library)", root, err))
+			failed = append(failed, root)
+			continue
+		}
+		files = append(files, found...)
+	}
+	return files, failed
+}
+
+// keepUnder marks the known files under the given roots as seen, so a
+// folder that's temporarily unreadable (e.g. an unmounted drive) doesn't
+// empty the library.
+func keepUnder(roots []string, known map[string]fileRow, seen map[string]bool) {
+	for _, root := range roots {
+		prefix := filepath.Clean(root) + string(filepath.Separator)
+		for p := range known {
+			if strings.HasPrefix(p, prefix) {
+				seen[p] = true
+			}
 		}
 	}
 }
