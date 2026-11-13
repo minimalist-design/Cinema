@@ -1,13 +1,25 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type Hls from "hls.js";
+import { Box } from "@mantine/core";
+import { ErrorAlert } from "./States";
 
 // HlsVideo plays an HLS playlist with the browser's native controls. Safari
 // (and other browsers with built-in HLS) play it directly; elsewhere hls.js
 // feeds it to the video element through Media Source Extensions. hls.js is
 // loaded on demand so it's only downloaded when needed. children go inside
-// the video element (e.g. <track>s).
-export function HlsVideo({ src, children }: { src: string; children?: ReactNode }) {
+// the video element (e.g. <track>s); frameClassName styles the box around it.
+export function HlsVideo({
+  src,
+  className,
+  frameClassName,
+  children,
+}: {
+  src: string;
+  className?: string;
+  frameClassName?: string;
+  children?: ReactNode;
+}) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -60,10 +72,12 @@ export function HlsVideo({ src, children }: { src: string; children?: ReactNode 
 
   return (
     <>
-      <video ref={videoRef} className="player-video" controls autoPlay>
-        {children}
-      </video>
-      {error ? <p role="alert">{error}</p> : null}
+      <Box className={frameClassName}>
+        <video ref={videoRef} className={className} controls autoPlay>
+          {children}
+        </video>
+      </Box>
+      {error ? <ErrorAlert>{error}</ErrorAlert> : null}
     </>
   );
 }

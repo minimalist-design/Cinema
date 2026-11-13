@@ -119,3 +119,10 @@ export const api = {
 
 export const episodeCode = (season: number, episode: number) =>
   `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
+
+// formatDate turns a TMDB date (YYYY-MM-DD) into a readable local one.
+export function formatDate(date: string) {
+  const d = new Date(`${date}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return date;
+  return d.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+}
