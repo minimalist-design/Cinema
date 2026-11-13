@@ -28,3 +28,12 @@
     outline: 2px solid var(--mantine-primary-color-filled);
   }
 }
+
+/* The episode that's playing. */
+.current {
+  background-color: var(--mantine-primary-color-light);
+
+  @mixin hover {
+    background-color: var(--mantine-primary-color-light);
+  }
+}

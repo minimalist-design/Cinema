@@ -1,9 +1,10 @@
 import type { ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
-import { Anchor, AspectRatio, Box, Breadcrumbs, Button, Center, Group, Loader, Stack, Text, Title } from "@mantine/core";
+import { Anchor, AspectRatio, Box, Breadcrumbs, Button, Center, Divider, Group, Loader, Stack, Text, Title } from "@mantine/core";
 import { useDocumentTitle } from "@mantine/hooks";
 import { api, episodeCode, formatDate } from "../api";
 import type { SubtitleTrack } from "../api";
+import { EpisodeBrowser } from "../components/EpisodeBrowser";
 import { HlsVideo } from "../components/HlsVideo";
 import { ErrorAlert, PageLoader } from "../components/States";
 import { ArrowRightIcon } from "../components/icons";
@@ -84,6 +85,22 @@ export function MoviePlayer() {
   );
 }
 
+// ShowEpisodes lists the show's episodes below the player, marking the one
+// playing.
+function ShowEpisodes({ showId, current }: { showId: number; current: { id: number; seasonNumber: number } }) {
+  const { data: show, error } = useFetch(() => api.show(String(showId)), [showId]);
+  if (error) return <ErrorAlert>{error}</ErrorAlert>;
+  if (!show) return <PageLoader />;
+  return (
+    <Box component="section">
+      <Title order={3} mb="md">
+        Episodes
+      </Title>
+      <EpisodeBrowser show={show} current={current} />
+    </Box>
+  );
+}
+
 export function EpisodePlayer() {
   const { id = "" } = useParams();
   const { data: ep, error, loading } = useFetch(() => api.episode(id), [id]);
@@ -115,6 +132,8 @@ export function EpisodePlayer() {
           </Button>
         ) : null}
       </Group>
+      <Divider />
+      <ShowEpisodes showId={ep.show.id} current={{ id: ep.id, seasonNumber: ep.seasonNumber }} />
     </PlayerLayout>
   );
 }
